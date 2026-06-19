@@ -5,6 +5,9 @@ edition = "2024"
 description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
 license = "MIT"
 
+[workspace]
+members = ["python"]
+
 [dependencies]
 ibapi = "3.0"
 tokio = { version = "1", features = ["full"] }
