@@ -95,6 +95,44 @@ println!(
 );
 ```
 
+### Subscribe to live market data ticks
+
+```rust
+use futures::StreamExt;
+
+let contract = ibcore::Contract::stock("SPY").build();
+let mut stream = ib.tick_stream(&contract).await?;
+while let Some(event) = stream.next().await {
+    match event? {
+        ibcore::TickEvent::Price { tick_type, price } => {
+            println!("{tick_type:?}: ${price:.2}");
+        }
+        ibcore::TickEvent::Greeks { delta, theta, implied_volatility, .. } => {
+            println!("delta={delta:.4}, theta={theta:.4}, iv={implied_volatility:.4}");
+        }
+        _ => {} // ignore Size, String, Generic, etc.
+    }
+}
+```
+
+### Fetch historical OHLCV bars
+
+```rust
+let contract = ibcore::Contract::stock("SPY").build();
+let data = ib.historical_data(
+    &contract,
+    ibcore::BarSize::Hour,
+    ibcore::Duration::days(5),
+    ibcore::WhatToShow::Trades,
+    ibcore::TradingHours::Regular,
+).await?;
+println!("Period: {} to {} — {} bars", data.start, data.end, data.bars.len());
+for bar in &data.bars {
+    println!("O={:.2}, H={:.2}, L={:.2}, C={:.2}, V={:.0}",
+        bar.open, bar.high, bar.low, bar.close, bar.volume);
+}
+```
+
 ### Monitor diagnostic events
 
 ```rust
@@ -147,7 +185,7 @@ ib.disconnect()
 
 ```python
 snap = ib.option_snapshot("SPY", 2025, 7, 17, 570.0, True, "CBOE")
-print(f"delta={snap.delta:.4f}, theta={snap.theta:.4f}, iv={snap.iv:.4f}")
+print(f"delta={snap.option_delta:.4f}, theta={snap.option_theta:.4f}, iv={snap.option_iv:.4f}")
 ```
 
 **Place an order**
@@ -198,6 +236,8 @@ cargo build -p ibkr-diag --release
 | `net_liquidation(account_id, currency)` | `Result<f64, IbError>` | Single net liquidation value |
 | `diagnostic_events()` | `broadcast::Receiver<DiagnosticEvent>` | Subscribe to structured diagnostic events |
 | `server_version()` | `i32` | Gateway server version |
+| `tick_stream(contract)` | `Result<TickStream, IbError>` | Subscribe to live market data ticks |
+| `historical_data(contract, bar_size, duration, what_to_show, trading_hours)` | `Result<HistoricalData, IbError>` | One-shot historical OHLCV bars |
 
 ### `DiagnosticEvent`
 
@@ -383,8 +423,7 @@ async with await IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper") as i
 
 ### Deferred types (Phase 2)
 
-Streaming (`TickEvent`, `TickStream`), historical data (`Bar`, `HistoricalData`),
-and order management (`OpenOrder`, `OrderStatusEvent`) are deferred to a
+Order management (`OpenOrder`, `OrderStatusEvent`) is deferred to a
 follow-up release.
 
 ## Related
