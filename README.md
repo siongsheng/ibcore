@@ -2,29 +2,26 @@
 
 Standalone Rust crate for integrating with Interactive Brokers TWS and IB Gateway.
 
-Wraps [`ibapi`] v3.0 with a clean async API, auto-reconnect, structured error
-types, and diagnostic event broadcasting. Zero Huat-specific logic — this is
-the foundation layer for any IBKR trading application.
+Wraps [`ibapi`] v3.0 with a clean async API, typed errors, market data
+snapshots, option chain resolution, and diagnostic event broadcasting.
 
 [`ibapi`]: https://crates.io/crates/ibapi
 
 ## Why ibcore?
 
-The raw IB API is callback-driven, error codes are numeric and undocumented,
-and connection drops are silent. ibcore fixes this:
+The IB API has quirks. ibcore smooths them over:
 
 | Raw ibapi | ibcore |
 |---|---|
-| Numeric error codes (`2107`) | Typed `IbError::FarmDisconnect` |
-| Callback-spaghetti notice stream | `tokio::sync::broadcast` of `DiagnosticEvent` |
+| Numeric error codes with inconsistent docs | Typed `IbError::FarmDisconnect` |
+| Error codes in notice stream | `tokio::sync::broadcast` of `DiagnosticEvent` |
 | Manual contract construction | `build_option_contract`, `get_primary_exchange` |
-| Silent disconnect | `is_connection_dead()` for reconnect logic |
+| No structured disconnect detection | `is_connection_dead()` for reconnect logic |
 | Raw `TickType` decoding | `StockSnapshot` / `OptionSnapshot` with Greeks |
 
-ibcore was extracted from [Huat](https://github.com/siongsheng/hermes-huat) —
-a live automated options trading system running real money through IBKR. Every
-quirk, every undocumented behavior, every reconnect edge case that Huat hit in
-production is baked into this crate.
+ibcore is built from production experience running automated options trading
+against IBKR. Every reconnect edge case, every data farm quirk, every
+undocumented behavior discovered in live trading is handled here.
 
 ## Quick Start
 
@@ -246,8 +243,6 @@ cargo test --lib
 
 - [ibquirk](https://ibquirk.com) — AI bot that diagnoses IBKR API problems
   using ibcore's DiagnosticEvents (launching soon)
-- [Huat](https://github.com/siongsheng/hermes-huat) — Automated options
-  trading system that ibcore was extracted from
 
 ## License
 
