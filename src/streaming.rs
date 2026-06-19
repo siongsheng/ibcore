@@ -141,12 +141,10 @@ impl TickStream {
     ///
     /// Returns `None` when the stream ends (connection closed / cancellation).
     pub async fn next(&mut self) -> Option<Result<TickEvent, IbError>> {
-        loop {
-            match self.inner.next().await {
-                Some(Ok(tick)) => return Some(Ok(TickEvent::from(tick))),
-                Some(Err(e)) => return Some(Err(IbError::from(e))),
-                None => return None,
-            }
+        match self.inner.next().await {
+            Some(Ok(tick)) => Some(Ok(TickEvent::from(tick))),
+            Some(Err(e)) => Some(Err(IbError::from(e))),
+            None => None,
         }
     }
 }
