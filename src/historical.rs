@@ -51,4 +51,10 @@ mod tests {
     fn trading_hours_exists() {
         assert_eq!(TradingHours::Regular, TradingHours::Regular);
     }
+
+    /// Construct HistoricalData with bars and verify field access.
+    #[test]
+    fn historical_data_struct_construction() {
+        todo!("implement HistoricalData construction test");
+    }
 }
