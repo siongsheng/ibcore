@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "ibcore"
+version = "0.1.0"
+description = "Standalone IB Gateway integration — market data snapshots, diagnostics, order placement"
+requires-python = ">=3.9"
+readme = "../README.md"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Operating System :: OS Independent",
+]
+[tool.maturin]
+features = ["python"]
+module-name = "ibcore._ibcore"
