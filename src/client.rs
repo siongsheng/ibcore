@@ -803,6 +803,14 @@ mod tests {
         let _ = _check;
     }
 
+    /// Validate that TickStream::new() with a oneshot-error stream
+    /// produces the correct IbError variant after the client's error
+    /// mapping path.
+    #[test]
+    fn tick_stream_error_maps_correctly() {
+        todo!("implement tick_stream error mapping test");
+    }
+
     // ── is_connection_dead tests ──
 
     #[test]
