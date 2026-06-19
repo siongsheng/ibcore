@@ -7,10 +7,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use ibcore::IbClient as RustIbClient;
-use pyo3::prelude::*;
+use ibcore::{
+    diagnostics::{self, AccountType as RustAccountType, DiagnosticEvent as RustDiagnosticEvent},
+    IbClient as RustIbClient,
+};
 use pyo3::exceptions::PyException;
-use pyo3::types::PyAnyMethods;
+use pyo3::prelude::*;
+use pyo3::types::{PyAnyMethods, PyDict, PyList};
 
 // ── PyO3 type bindings ─────────────────────────────────────────────────────
 
@@ -26,6 +29,17 @@ pub struct PyStockSnapshot {
     ask: f64,
     #[pyo3(get)]
     close: f64,
+}
+
+impl From<ibcore::StockSnapshot> for PyStockSnapshot {
+    fn from(s: ibcore::StockSnapshot) -> Self {
+        PyStockSnapshot {
+            last: s.last,
+            bid: s.bid,
+            ask: s.ask,
+            close: s.close,
+        }
+    }
 }
 
 #[pymethods]
@@ -62,6 +76,22 @@ pub struct PyOptionSnapshot {
     underlying_price: f64,
 }
 
+impl From<ibcore::OptionSnapshot> for PyOptionSnapshot {
+    fn from(s: ibcore::OptionSnapshot) -> Self {
+        PyOptionSnapshot {
+            bid: s.bid,
+            ask: s.ask,
+            last: s.last,
+            option_iv: s.option_iv,
+            option_delta: s.option_delta,
+            option_gamma: s.option_gamma,
+            option_theta: s.option_theta,
+            option_price: s.option_price,
+            underlying_price: s.underlying_price,
+        }
+    }
+}
+
 #[pymethods]
 impl PyOptionSnapshot {
     fn __repr__(&self) -> String {
@@ -94,6 +124,21 @@ pub struct PyDiagnosticEvent {
     os: String,
     #[pyo3(get)]
     timestamp: String,
+}
+
+impl From<RustDiagnosticEvent> for PyDiagnosticEvent {
+    fn from(e: RustDiagnosticEvent) -> Self {
+        PyDiagnosticEvent {
+            gateway_version: e.gateway_version,
+            error_code: e.error_code,
+            error_message: e.error_message,
+            farm_status: e.farm_status.to_string(),
+            connection_state: e.connection_state.to_string(),
+            account_type: e.account_type.to_string(),
+            os: e.os.to_string(),
+            timestamp: e.timestamp.to_rfc3339(),
+        }
+    }
 }
 
 #[pymethods]
@@ -130,12 +175,7 @@ impl PyFarmState {
 
     #[staticmethod]
     fn from_code(code: i32) -> String {
-        match code {
-            2104 | 2106 => "ok".to_string(),
-            2105 | 2108 => "warning".to_string(),
-            2107 => "inactive".to_string(),
-            other => format!("unknown({})", other),
-        }
+        diagnostics::classify_farm(code).to_string()
     }
 
     #[staticmethod]
@@ -183,6 +223,50 @@ pub struct PyIbError {
     message: String,
 }
 
+/// Convert a Rust `IbError` to a Python `PyErr`.
+pub fn ib_err_to_py_err(e: &ibcore::IbError) -> PyErr {
+    let (category, code, message) = map_ib_error(e);
+    PyErr::new::<PyIbError, _>((category, code, message))
+}
+
+/// Convert a Rust `IbError` to arguments for constructing a Python `IbError`.
+fn map_ib_error(e: &ibcore::IbError) -> (String, Option<i32>, String) {
+    match e {
+        ibcore::IbError::ConnectionFailed(msg) => {
+            ("connection_failed".into(), None, msg.clone())
+        }
+        ibcore::IbError::ConnectionReset => {
+            ("connection_reset".into(), None, "connection reset".into())
+        }
+        ibcore::IbError::MarketData { code, message } => {
+            ("market_data".into(), Some(*code), message.clone())
+        }
+        ibcore::IbError::OrderRejected {
+            code,
+            message,
+            rejection_json,
+        } => {
+            let msg = if let Some(json) = rejection_json {
+                format!("{} [{}]", message, json)
+            } else {
+                message.clone()
+            };
+            ("order_rejected".into(), Some(*code), msg)
+        }
+        ibcore::IbError::FarmDisconnect { code, message } => {
+            ("farm_disconnect".into(), Some(*code), message.clone())
+        }
+        ibcore::IbError::ContractResolution(msg) => {
+            ("contract_resolution".into(), None, msg.clone())
+        }
+        ibcore::IbError::CompetingSession => {
+            ("competing_session".into(), None, "competing session (10197)".into())
+        }
+        ibcore::IbError::Timeout(msg) => ("timeout".into(), None, msg.clone()),
+        ibcore::IbError::Other(msg) => ("other".into(), None, msg.clone()),
+    }
+}
+
 #[pymethods]
 impl PyIbError {
     #[new]
@@ -207,6 +291,36 @@ impl PyIbError {
 pub struct PyIbClient {
     inner: Arc<Mutex<Option<RustIbClient>>>,
     _account_type: String,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+fn parse_account_type(s: &str) -> Result<RustAccountType, PyErr> {
+    match s {
+        "live" => Ok(RustAccountType::Live),
+        "paper" => Ok(RustAccountType::Paper),
+        other => Err(PyErr::new::<PyIbError, _>((
+            "connection_failed".to_string(),
+            None::<i32>,
+            format!("invalid account_type: {other}"),
+        ))),
+    }
+}
+
+fn with_client<F, T>(inner: &Arc<Mutex<Option<RustIbClient>>>, f: F) -> PyResult<T>
+where
+    F: FnOnce(&RustIbClient) -> PyResult<T>,
+{
+    let guard = inner.lock().map_err(|e| {
+        PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+    })?;
+    match guard.as_ref() {
+        Some(client) => f(client),
+        None => Err(PyErr::new::<PyIbError, _>((
+            "connection_failed".to_string(),
+            None::<i32>,
+            "not connected".to_string(),
+        ))),
+    }
 }
 
 #[pymethods]
@@ -214,77 +328,211 @@ impl PyIbClient {
     #[staticmethod]
     fn connect(
         py: Python<'_>,
-        _host: &str,
-        _port: u16,
-        _client_id: i32,
-        _market_data_type: &str,
-        _account_type: &str,
+        host: &str,
+        port: u16,
+        client_id: i32,
+        market_data_type: &str,
+        account_type: &str,
     ) -> PyResult<Py<Self>> {
-        todo!()
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            PyErr::new::<PyIbError, _>((
+                "connection_failed".to_string(),
+                None::<i32>,
+                format!("runtime creation failed: {e}"),
+            ))
+        })?;
+        let acct = parse_account_type(account_type)?;
+        let client = rt
+            .block_on(RustIbClient::connect(host, port, client_id, market_data_type, acct))
+            .map_err(|e| ib_err_to_py_err(&e))?;
+        let py_client = PyIbClient {
+            inner: Arc::new(Mutex::new(Some(client))),
+            _account_type: account_type.to_string(),
+            rt: Arc::new(rt),
+        };
+        Py::new(py, py_client)
     }
 
-    fn _disconnect(&self) -> PyResult<()> {
-        todo!()
+    #[pyo3(signature = (host, port, client_id, market_data_type))]
+    fn reconnect(
+        &self,
+        host: &str,
+        port: u16,
+        client_id: i32,
+        market_data_type: &str,
+    ) -> PyResult<()> {
+        let mut guard = self.inner.lock().map_err(|e| {
+            PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+        })?;
+        let client = guard.as_mut().ok_or_else(|| {
+            PyErr::new::<PyIbError, _>((
+                "connection_failed".to_string(),
+                None::<i32>,
+                "not connected".to_string(),
+            ))
+        })?;
+        self.rt
+            .block_on(client.reconnect(host, port, client_id, market_data_type))
+            .map_err(|e| ib_err_to_py_err(&e))?;
+        Ok(())
+    }
+
+    fn disconnect(&self) -> PyResult<()> {
+        with_client(&self.inner, |client| {
+            self.rt.block_on(client.disconnect());
+            Ok(())
+        })?;
+        // Clear the inner client
+        let mut guard = self.inner.lock().map_err(|e| {
+            PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+        })?;
+        *guard = None;
+        Ok(())
     }
 
     // ── Snapshot methods ──
 
-    fn stock_snapshot(&self, _symbol: &str) -> PyResult<PyStockSnapshot> {
-        todo!()
+    fn stock_snapshot(&self, symbol: &str) -> PyResult<PyStockSnapshot> {
+        with_client(&self.inner, |client| {
+            let snap = self
+                .rt
+                .block_on(client.stock_snapshot(symbol))
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            Ok(PyStockSnapshot::from(snap))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn option_snapshot(
         &self,
-        _symbol: &str,
-        _expiry_year: i32,
-        _expiry_month: i32,
-        _expiry_day: i32,
-        _strike: f64,
-        _is_call: bool,
-        _exchange: &str,
+        symbol: &str,
+        expiry_year: i32,
+        expiry_month: i32,
+        expiry_day: i32,
+        strike: f64,
+        is_call: bool,
+        exchange: &str,
     ) -> PyResult<PyOptionSnapshot> {
-        todo!()
+        with_client(&self.inner, |client| {
+            let snap = self
+                .rt
+                .block_on(client.option_snapshot(
+                    symbol,
+                    (expiry_year as u16, expiry_month as u8, expiry_day as u8),
+                    strike,
+                    is_call,
+                    0.0, // _implied_vol — unused internally, kept for API compat
+                    0.0, // _underlying_price — unused, kept for API compat
+                    exchange,
+                ))
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            Ok(PyOptionSnapshot::from(snap))
+        })
     }
 
     // ── Account methods ──
 
-    fn positions(&self) -> PyResult<Vec<PyObject>> {
-        todo!()
+    fn positions(&self, py: Python<'_>) -> PyResult<PyObject> {
+        with_client(&self.inner, |client| {
+            let positions = self
+                .rt
+                .block_on(client.positions())
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let py_list = positions
+                .into_iter()
+                .map(|p| {
+                    let pos_dict = PyDict::new(py);
+                    pos_dict.set_item("symbol", p.contract.symbol.0).unwrap();
+                    pos_dict.set_item("quantity", p.position).unwrap();
+                    pos_dict.set_item("avg_cost", p.average_cost).unwrap();
+                    pos_dict.set_item("currency", p.contract.currency.0).unwrap();
+                    pos_dict.into()
+                })
+                .collect::<Vec<PyObject>>();
+            Ok(PyList::new(py, py_list)?.into())
+        })
     }
 
-    fn account_summary(&self, _tags: Vec<String>) -> PyResult<Vec<PyObject>> {
-        todo!()
+    fn account_summary(&self, py: Python<'_>, tags: Vec<String>) -> PyResult<PyObject> {
+        with_client(&self.inner, |client| {
+            let tags_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+            let results = self
+                .rt
+                .block_on(client.account_summary(&tags_refs))
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let py_list = results
+                .into_iter()
+                .map(|(account, tag, value, currency)| {
+                    let d = PyDict::new(py);
+                    d.set_item("account", account).unwrap();
+                    d.set_item("tag", tag).unwrap();
+                    d.set_item("value", value).unwrap();
+                    d.set_item("currency", currency).unwrap();
+                    d.into()
+                })
+                .collect::<Vec<PyObject>>();
+            Ok(PyList::new(py, py_list)?.into())
+        })
     }
 
-    fn net_liquidation(&self, _account_id: String) -> PyResult<f64> {
-        todo!()
+    fn net_liquidation(&self, account_id: &str) -> PyResult<f64> {
+        with_client(&self.inner, |client| {
+            self.rt
+                .block_on(client.net_liquidation(account_id))
+                .map_err(|e| ib_err_to_py_err(&e))
+        })
     }
 
     // ── Order methods ──
 
-    #[pyo3(signature = (_symbol, _action, _quantity, _order_type, _limit_price=None, _exchange="SMART"))]
+    #[pyo3(signature = (symbol, action, quantity, order_type, limit_price=None, exchange="SMART"))]
     fn place_order(
         &self,
-        _symbol: &str,
-        _action: &str,
-        _quantity: f64,
-        _order_type: &str,
-        _limit_price: Option<f64>,
-        _exchange: &str,
+        symbol: &str,
+        action: &str,
+        quantity: f64,
+        order_type: &str,
+        limit_price: Option<f64>,
+        exchange: &str,
     ) -> PyResult<i32> {
-        todo!()
+        with_client(&self.inner, |client| {
+            let contract = ibcore::Contract::stock(symbol)
+                .on_exchange(exchange)
+                .build();
+            let mut order = ibapi::orders::Order::default();
+            order.action = match action.to_uppercase().as_str() {
+                "BUY" => ibapi::orders::Action::Buy,
+                "SELL" => ibapi::orders::Action::Sell,
+                other => {
+                    return Err(PyErr::new::<PyIbError, _>((
+                        "order_rejected".to_string(),
+                        None::<i32>,
+                        format!("invalid action: {other}"),
+                    )))
+                }
+            };
+            order.total_quantity = quantity;
+            order.order_type = order_type.to_string();
+            order.limit_price = limit_price;
+            self.rt
+                .block_on(client.place_order(&contract, &order))
+                .map_err(|e| ib_err_to_py_err(&e))
+        })
     }
 
-    fn cancel_order(&self, _order_id: i32) -> PyResult<()> {
-        todo!()
+    fn cancel_order(&self, order_id: i32) -> PyResult<()> {
+        with_client(&self.inner, |client| {
+            self.rt
+                .block_on(client.cancel_order(order_id))
+                .map_err(|e| ib_err_to_py_err(&e))
+        })
     }
 
     // ── Properties ──
 
     #[getter]
     fn server_version(&self) -> PyResult<i32> {
-        todo!()
+        with_client(&self.inner, |client| Ok(client.server_version()))
     }
 
     #[getter]
@@ -294,31 +542,40 @@ impl PyIbClient {
 
     // ── Context manager ──
 
-    fn __aenter__(slf: PyRef<'_, Self>) -> PyResult<Py<Self>> {
-        todo!()
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<Py<Self>> {
+        Ok(slf.into())
     }
 
-    fn __aexit__(
+    fn __exit__(
         &self,
         _exc_type: PyObject,
         _exc_value: PyObject,
         _traceback: PyObject,
     ) -> PyResult<()> {
-        todo!()
+        // Disconnect on exit from context manager
+        let _ = self.disconnect();
+        Ok(())
     }
 
     // ── Diagnostics ──
 
     fn diagnostic_events(&self) -> PyResult<PyDiagnosticEventReceiver> {
-        todo!()
+        with_client(&self.inner, |client| {
+            let rx = client.diagnostic_events();
+            Ok(PyDiagnosticEventReceiver { inner: Some(rx) })
+        })
     }
 }
 
 // ── DiagnosticEventReceiver ──────────────────────────────────────────────
 
+use tokio::sync::broadcast;
+
 /// Iterator over diagnostic events from the broadcast channel.
 #[pyclass(name = "DiagnosticEventReceiver")]
-pub struct PyDiagnosticEventReceiver;
+pub struct PyDiagnosticEventReceiver {
+    inner: Option<broadcast::Receiver<RustDiagnosticEvent>>,
+}
 
 #[pymethods]
 impl PyDiagnosticEventReceiver {
@@ -326,16 +583,30 @@ impl PyDiagnosticEventReceiver {
         slf
     }
 
-    fn __next__(&self) -> PyResult<Option<PyDiagnosticEvent>> {
-        todo!()
+    fn __next__(&mut self) -> PyResult<Option<PyDiagnosticEvent>> {
+        match &mut self.inner {
+            Some(rx) => match rx.try_recv() {
+                Ok(event) => Ok(Some(PyDiagnosticEvent::from(event))),
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => Ok(None),
+                Err(broadcast::error::TryRecvError::Lagged(_n)) => {
+                    // Try once more after lag
+                    match rx.try_recv() {
+                        Ok(event) => Ok(Some(PyDiagnosticEvent::from(event))),
+                        _ => Ok(None),
+                    }
+                }
+            },
+            None => Ok(None),
+        }
     }
 
-    fn try_next(&self) -> PyResult<Option<PyDiagnosticEvent>> {
-        todo!()
+    fn try_next(&mut self) -> PyResult<Option<PyDiagnosticEvent>> {
+        self.__next__()
     }
 
-    fn poll(&self, _timeout: f64) -> PyResult<Option<PyDiagnosticEvent>> {
-        todo!()
+    fn poll(&mut self, _timeout: f64) -> PyResult<Option<PyDiagnosticEvent>> {
+        self.__next__()
     }
 }
 
@@ -400,6 +671,21 @@ mod tests {
         })
     }
 
+    #[test]
+    fn stock_snapshot_from_rust() {
+        let rust = ibcore::StockSnapshot {
+            last: 100.0,
+            bid: 99.99,
+            ask: 100.01,
+            close: 99.50,
+        };
+        let py: PyStockSnapshot = rust.into();
+        assert_eq!(py.last, 100.0);
+        assert_eq!(py.bid, 99.99);
+        assert_eq!(py.ask, 100.01);
+        assert_eq!(py.close, 99.50);
+    }
+
     // ── OptionSnapshot tests ──
 
     #[test]
@@ -430,6 +716,24 @@ mod tests {
         })
     }
 
+    #[test]
+    fn option_snapshot_from_rust() {
+        let rust = ibcore::OptionSnapshot {
+            bid: 2.0,
+            ask: 2.10,
+            last: 2.05,
+            option_iv: 0.30,
+            option_delta: 0.50,
+            option_gamma: 0.06,
+            option_theta: -0.04,
+            option_price: 2.05,
+            underlying_price: 500.0,
+        };
+        let py: PyOptionSnapshot = rust.into();
+        assert!((py.bid - 2.0).abs() < 0.001);
+        assert!((py.option_delta - 0.50).abs() < 0.001);
+    }
+
     // ── DiagnosticEvent tests ──
 
     #[test]
@@ -447,10 +751,7 @@ mod tests {
             };
             let py_event = Py::new(py, event)?;
             let bind = py_event.bind(py);
-            assert_eq!(
-                bind.getattr("gateway_version")?.extract::<i32>()?,
-                221
-            );
+            assert_eq!(bind.getattr("gateway_version")?.extract::<i32>()?, 221);
             assert_eq!(bind.getattr("error_code")?.extract::<i32>()?, 2104);
             assert_eq!(
                 bind.getattr("error_message")?.extract::<String>()?,
@@ -472,6 +773,30 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn diagnostic_event_from_rust() {
+        use chrono::TimeZone;
+        let rust = RustDiagnosticEvent {
+            gateway_version: 221,
+            error_code: 2104,
+            error_message: "test".into(),
+            error_time: None,
+            farm_status: ibcore::diagnostics::FarmState::Ok,
+            connection_state: ibcore::diagnostics::ConnectionState::Connected,
+            account_type: ibcore::diagnostics::AccountType::Paper,
+            os: "linux",
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap(),
+        };
+        let py: PyDiagnosticEvent = rust.into();
+        assert_eq!(py.gateway_version, 221);
+        assert_eq!(py.error_code, 2104);
+        assert_eq!(py.error_message, "test");
+        assert_eq!(py.farm_status, "ok");
+        assert_eq!(py.connection_state, "connected");
+        assert_eq!(py.account_type, "paper");
+        assert_eq!(py.os, "linux");
     }
 
     // ── FarmState tests ──
@@ -548,10 +873,7 @@ mod tests {
         Python::with_gil(|py| {
             let cs = Py::new(py, PyConnectionState)?;
             let bind = cs.bind(py);
-            assert_eq!(
-                bind.getattr("CONNECTED")?.extract::<String>()?,
-                "connected"
-            );
+            assert_eq!(bind.getattr("CONNECTED")?.extract::<String>()?, "connected");
             assert_eq!(
                 bind.getattr("DISCONNECTED")?.extract::<String>()?,
                 "disconnected"
@@ -608,6 +930,118 @@ mod tests {
         })
     }
 
+    #[test]
+    fn ib_error_from_rust_connection_failed() {
+        let rust = ibcore::IbError::ConnectionFailed("timeout".into());
+        let (category, code, message) = map_ib_error(&rust);
+        assert_eq!(category, "connection_failed");
+        assert!(code.is_none());
+        assert_eq!(message, "timeout");
+    }
+
+    #[test]
+    fn ib_error_from_rust_market_data() {
+        let rust = ibcore::IbError::MarketData {
+            code: 10197,
+            message: "competing".into(),
+        };
+        let (category, code, message) = map_ib_error(&rust);
+        assert_eq!(category, "market_data");
+        assert_eq!(code, Some(10197));
+        assert_eq!(message, "competing");
+    }
+
+    #[test]
+    fn ib_error_from_rust_order_rejected_with_json() {
+        let rust = ibcore::IbError::OrderRejected {
+            code: 201,
+            message: "insufficient funds".into(),
+            rejection_json: None,
+        };
+        let (category, code, message) = map_ib_error(&rust);
+        assert_eq!(category, "order_rejected");
+        assert_eq!(code, Some(201));
+        assert!(message.contains("insufficient funds"));
+        assert!(message.contains("insufficient funds"));
+    }
+
+    // ── IbClient tests ──
+
+    #[test]
+    fn ib_client_has_correct_attrs() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyIbClient>();
+            assert!(cls.getattr("connect").is_ok());
+            assert!(cls.getattr("reconnect").is_ok());
+            assert!(cls.getattr("disconnect").is_ok());
+            assert!(cls.getattr("stock_snapshot").is_ok());
+            assert!(cls.getattr("option_snapshot").is_ok());
+            assert!(cls.getattr("positions").is_ok());
+            assert!(cls.getattr("account_summary").is_ok());
+            assert!(cls.getattr("net_liquidation").is_ok());
+            assert!(cls.getattr("place_order").is_ok());
+            assert!(cls.getattr("cancel_order").is_ok());
+            assert!(cls.getattr("server_version").is_ok());
+            assert!(cls.getattr("account_type").is_ok());
+            assert!(cls.getattr("diagnostic_events").is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ib_client_connect_requires_gateway() -> PyResult<()> {
+        // Without a running Gateway, connect should return an IbError,
+        // not crash or hang forever.
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyIbClient>();
+            let result = cls.call_method1(
+                "connect",
+                ("127.0.0.1", 9999_i32, 1_i32, "delayed", "paper"),
+            );
+            match result {
+                Err(e) => {
+                    let err_str = e.to_string();
+                    assert!(
+                        err_str.contains("connection")
+                            || err_str.contains("refused")
+                            || err_str.contains("reset"),
+                        "unexpected error: {err_str}"
+                    );
+                }
+                Ok(_) => panic!("connect should fail without a running Gateway"),
+            }
+            Ok(())
+        })
+    }
+
+    // ── DiagnosticEventReceiver tests ──
+
+    #[test]
+    fn diagnostic_event_receiver_attrs() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let recv = PyDiagnosticEventReceiver { inner: None };
+            let py_recv = Py::new(py, recv)?;
+            let bind = py_recv.bind(py);
+            assert!(bind.getattr("__iter__").is_ok());
+            assert!(bind.getattr("__next__").is_ok());
+            assert!(bind.getattr("try_next").is_ok());
+            assert!(bind.getattr("poll").is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn diagnostic_event_receiver_empty_raises_stop_iteration() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let recv = PyDiagnosticEventReceiver { inner: None };
+            let py_recv = Py::new(py, recv)?;
+            let bind = py_recv.bind(py);
+            let result = bind.call_method0("__next__");
+            assert!(result.is_err(), "expected StopIteration when empty");
+            Ok(())
+        })
+    }
+
     // ── Module registration tests ──
 
     #[test]
@@ -626,5 +1060,43 @@ mod tests {
             assert!(m.getattr("DiagnosticEventReceiver").is_ok());
             Ok(())
         })
+    }
+
+    #[test]
+    fn from_rust_errors_map_correctly() {
+        let test_cases: Vec<(ibcore::IbError, &str)> = vec![
+            (ibcore::IbError::ConnectionFailed("fail".into()), "connection_failed"),
+            (ibcore::IbError::ConnectionReset, "connection_reset"),
+            (
+                ibcore::IbError::MarketData {
+                    code: 10197,
+                    message: "md".into(),
+                },
+                "market_data",
+            ),
+            (
+                ibcore::IbError::OrderRejected {
+                    code: 201,
+                    message: "rej".into(),
+                    rejection_json: None,
+                },
+                "order_rejected",
+            ),
+            (
+                ibcore::IbError::FarmDisconnect {
+                    code: 2107,
+                    message: "fm".into(),
+                },
+                "farm_disconnect",
+            ),
+            (ibcore::IbError::ContractResolution("res".into()), "contract_resolution"),
+            (ibcore::IbError::CompetingSession, "competing_session"),
+            (ibcore::IbError::Timeout("time".into()), "timeout"),
+            (ibcore::IbError::Other("etc".into()), "other"),
+        ];
+        for (err, expected_cat) in test_cases {
+            let (cat, _, _) = map_ib_error(&err);
+            assert_eq!(cat, expected_cat, "mismatch for {err}");
+        }
     }
 }
