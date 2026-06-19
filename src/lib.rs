@@ -43,7 +43,7 @@ pub mod contract;
 // ── Re-exports ──────────────────────────────────────────────────────────────
 // (Uncommented as modules are implemented)
 
-// pub use client::IbClient;
+pub use client::{IbClient, is_connection_dead};
 // pub use snapshots::{StockSnapshot, OptionSnapshot};
 // pub use chain::OptionChainData;
 // pub use diagnostics::{DiagnosticEvent, FarmState, ConnectionState, AccountType};
