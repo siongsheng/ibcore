@@ -1,0 +1,15 @@
+[package]
+name = "ibcore"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
+license = "MIT"
+
+[dependencies]
+ibapi = "3.0"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+thiserror = "2"
+tracing = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
