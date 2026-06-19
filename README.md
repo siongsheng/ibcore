@@ -115,6 +115,24 @@ let watcher = task::spawn(async move {
 });
 ```
 
+## CLI Tool
+
+ibcore ships a diagnostic CLI tool for Gateway health checks:
+
+```bash
+# Build from source
+cargo build -p ibkr-diag --release
+
+# Check versions
+./target/release/ibkr-diag version
+
+# Run a 10-second diagnostic against local Gateway
+./target/release/ibkr-diag diagnose --duration 10
+
+# JSON output for scripting
+./target/release/ibkr-diag diagnose --json | jq '.farm_state_counts'
+```
+
 ## API Overview
 
 ### `IbClient`
