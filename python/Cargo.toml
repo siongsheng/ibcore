@@ -1,0 +1,15 @@
+[package]
+name = "ibcore-python"
+version = "0.1.0"
+edition = "2024"
+description = "PyO3 Python bindings for ibcore — market data snapshots, diagnostics, order placement"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ibcore = { path = ".." }
+pyo3 = { version = "0.23", features = ["experimental-async", "chrono"] }
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
