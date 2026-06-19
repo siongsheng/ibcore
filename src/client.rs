@@ -729,6 +729,22 @@ mod tests {
         let _ = _check;
     }
 
+    /// Compile-time check: this won't compile until historical_data() exists on IbClient.
+    #[test]
+    fn historical_data_method_exists() {
+        fn _check(
+            ib: &IbClient,
+            c: &ibapi::contracts::Contract,
+            bs: &ibapi::market_data::historical::BarSize,
+            d: &ibapi::market_data::historical::Duration,
+            w: &ibapi::market_data::historical::WhatToShow,
+            th: &ibapi::market_data::TradingHours,
+        ) {
+            let _ = ib.historical_data(c, *bs, d.clone(), *w, *th);
+        }
+        let _ = _check;
+    }
+
     // ── is_connection_dead tests ──
 
     #[test]
