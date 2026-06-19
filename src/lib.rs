@@ -41,18 +41,15 @@ pub mod exchange;
 pub mod contract;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────
-// (Uncommented as modules are implemented)
 
 pub use client::{IbClient, is_connection_dead};
-// pub use snapshots::{StockSnapshot, OptionSnapshot};
-// pub use chain::OptionChainData;
-// pub use diagnostics::{DiagnosticEvent, FarmState, ConnectionState, AccountType};
-pub use errors::IbError;
-pub use exchange::get_primary_exchange;
-pub use contract::{build_option_contract, parse_expiry};
 pub use snapshots::{StockSnapshot, OptionSnapshot};
 pub use chain::OptionChainData;
 pub use diagnostics::{DiagnosticEvent, FarmState, ConnectionState, AccountType};
+pub use errors::IbError;
+pub use exchange::get_primary_exchange;
+pub use contract::{build_option_contract, parse_expiry};
+
 // ibapi re-exports — so Huat only needs ibcore
 pub use ibapi::contracts::{Contract, OptionRight, SecurityType, LegAction};
 pub use ibapi::accounts::{Position, PnL};
