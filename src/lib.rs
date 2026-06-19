@@ -66,3 +66,13 @@ pub use ibapi::orders::{Action, OrderStatusKind, Orders, order_builder::{combo_l
 pub use ibapi::subscriptions::SubscriptionItemStreamExt;
 pub use ibapi::market_data::MarketDataType;
 pub use ibapi::prelude::*;
+
+// ── Version information ─────────────────────────────────────────────────────
+
+/// Crate version string, from `CARGO_PKG_VERSION` at compile time.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Version of the `ibapi` dependency this crate was built against.
+pub const IBAPI_VERSION: &str = "3.0";

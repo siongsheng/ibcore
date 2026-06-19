@@ -6,7 +6,7 @@ description = "Standalone IB Gateway integration layer wrapping ibapi — diagno
 license = "MIT"
 
 [workspace]
-members = ["python"]
+members = ["python", "cli"]
 
 [dependencies]
 ibapi = "3.0"
