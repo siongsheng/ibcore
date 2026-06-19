@@ -25,6 +25,10 @@ use ibapi::{
     contracts::{Contract, OptionRight, SecurityType, tick_types::TickType},
     market_data::MarketDataType,
     market_data::realtime::TickTypes,
+    market_data::historical::{
+        BarSize, Duration, HistoricalData, WhatToShow,
+    },
+    market_data::TradingHours,
     subscriptions::SubscriptionItemStreamExt,
 };
 use tokio::sync::broadcast;
@@ -39,6 +43,7 @@ use crate::{
     exchange::get_primary_exchange,
     chain::OptionChainData,
     snapshots::{OptionSnapshot, StockSnapshot},
+    TickStream,
 };
 
 /// Maximum number of diagnostic events that can be buffered before old ones
@@ -620,6 +625,105 @@ impl IbClient {
         ))
     }
 
+    /// Subscribe to live market data ticks for a contract.
+    ///
+    /// Returns a [`TickStream`] that yields typed [`TickEvent`]s as they arrive.
+    /// Drop the stream to cancel the IB subscription.
+    ///
+    /// # Example (requires a running IB Gateway)
+    /// ```no_run
+    /// # async fn example() -> Result<(), ibcore::IbError> {
+    /// # let ib = ibcore::IbClient::connect(
+    /// #     "127.0.0.1", 4002, 1, "delayed", ibcore::AccountType::Paper
+    /// # ).await?;
+    /// use futures::StreamExt;
+    ///
+    /// let contract = ibcore::Contract::stock("SPY").build();
+    /// let mut stream = ib.tick_stream(&contract).await?;
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         ibcore::TickEvent::Price { tick_type, price } => {
+    ///             println!("{tick_type:?}: ${price:.2}");
+    ///         }
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # ib.disconnect().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn tick_stream(
+        &self,
+        contract: &ibapi::contracts::Contract,
+    ) -> Result<TickStream, IbError> {
+        let symbol = &contract.symbol;
+        let sub = self
+            .inner
+            .market_data(contract)
+            .subscribe()
+            .await
+            .map_err(|e| IbError::MarketData {
+                code: 0,
+                message: format!("tick_stream subscribe failed for {symbol}: {e}"),
+            })?;
+        tracing::info!("tick_stream subscribed for {symbol}");
+        Ok(TickStream::from_subscription(sub))
+    }
+
+    /// Fetch one-shot historical OHLCV bars for a contract.
+    ///
+    /// # Example (requires a running IB Gateway)
+    /// ```no_run
+    /// # async fn example() -> Result<(), ibcore::IbError> {
+    /// # let ib = ibcore::IbClient::connect(
+    /// #     "127.0.0.1", 4002, 1, "delayed", ibcore::AccountType::Paper
+    /// # ).await?;
+    /// let contract = ibcore::Contract::stock("SPY").build();
+    /// let data = ib.historical_data(
+    ///     &contract,
+    ///     ibcore::BarSize::Hour,
+    ///     ibcore::Duration::days(5),
+    ///     ibcore::WhatToShow::Trades,
+    ///     ibcore::TradingHours::Regular,
+    /// ).await?;
+    /// for bar in &data.bars {
+    ///     println!("O={:.2} H={:.2} L={:.2} C={:.2} V={:.0}",
+    ///         bar.open, bar.high, bar.low, bar.close, bar.volume);
+    /// }
+    /// # ib.disconnect().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn historical_data(
+        &self,
+        contract: &ibapi::contracts::Contract,
+        bar_size: BarSize,
+        duration: Duration,
+        what_to_show: WhatToShow,
+        trading_hours: TradingHours,
+    ) -> Result<HistoricalData, IbError> {
+        let symbol = &contract.symbol;
+        let data = self
+            .inner
+            .historical_data(contract, bar_size)
+            .duration(duration)
+            .what_to_show(what_to_show)
+            .trading_hours(trading_hours)
+            .fetch()
+            .await
+            .map_err(|e| IbError::MarketData {
+                code: 0,
+                message: format!("historical_data fetch failed for {symbol}: {e}"),
+            })?;
+        tracing::info!(
+            "historical_data fetched for {symbol}: {} bars, period {} to {}",
+            data.bars.len(),
+            data.start,
+            data.end,
+        );
+        Ok(data)
+    }
+
     /// Fetch NetLiquidation from account summary.
     pub async fn net_liquidation(&self, _account_id: &str) -> Result<f64, IbError> {
         let summary = self.account_summary(&["NetLiquidation"]).await?;
@@ -672,6 +776,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile-time check: this won't compile until tick_stream() exists on IbClient.
+    /// The inner function references the method by name; if it's missing, rustc fails.
+    #[test]
+    fn tick_stream_method_exists() {
+        fn _check(ib: &IbClient, c: &ibapi::contracts::Contract) {
+            let _ = ib.tick_stream(c);
+        }
+        let _ = _check;
+    }
+
+    /// Compile-time check: this won't compile until historical_data() exists on IbClient.
+    #[test]
+    fn historical_data_method_exists() {
+        fn _check(
+            ib: &IbClient,
+            c: &ibapi::contracts::Contract,
+            bs: &ibapi::market_data::historical::BarSize,
+            d: &ibapi::market_data::historical::Duration,
+            w: &ibapi::market_data::historical::WhatToShow,
+            th: &ibapi::market_data::TradingHours,
+        ) {
+            let _ = ib.historical_data(c, *bs, d.clone(), *w, *th);
+        }
+        let _ = _check;
+    }
+
+    /// Validate that TickStream::new() with a oneshot-error stream
+    /// produces the correct IbError variant after the client's error
+    /// mapping path.
+    #[tokio::test]
+    async fn tick_stream_error_maps_correctly() {
+        use futures::StreamExt;
+        use futures::stream::BoxStream;
+        use ibapi::market_data::realtime::TickTypes;
+        use crate::TickStream;
+
+        // Build a stream that yields one error then ends
+        let stream: BoxStream<'static, Result<TickTypes, ibapi::Error>> =
+            futures::stream::once(async {
+                Err(ibapi::Error::ConnectionReset)
+            })
+            .boxed();
+        let mut ts = TickStream::new(stream);
+
+        // The first item should be the error mapped to IbError
+        let item = ts.next().await;
+        match item {
+            Some(Err(IbError::ConnectionReset)) => {} // expected
+            other => panic!("expected Some(Err(ConnectionReset)), got {other:?}"),
+        }
+
+        // After the error, the stream should be exhausted
+        let next = ts.next().await;
+        assert!(next.is_none(), "expected None after stream ends");
+    }
 
     // ── is_connection_dead tests ──
 
