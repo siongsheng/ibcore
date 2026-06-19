@@ -1,7 +1,7 @@
 """Tests for IbClient class existence, method presence, and error handling."""
 
 import pytest
-from ibcore._ibcore import IbClient, IbError
+from _ibcore import IbClient, IbError
 
 
 class TestIbClientClass:
