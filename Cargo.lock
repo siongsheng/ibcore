@@ -291,6 +291,7 @@ name = "ibcore-python"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ibapi",
  "ibcore",
  "pyo3",
  "tokio",
