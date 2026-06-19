@@ -25,6 +25,10 @@ use ibapi::{
     contracts::{Contract, OptionRight, SecurityType, tick_types::TickType},
     market_data::MarketDataType,
     market_data::realtime::TickTypes,
+    market_data::historical::{
+        BarSize, Duration, HistoricalData, WhatToShow,
+    },
+    market_data::TradingHours,
     subscriptions::SubscriptionItemStreamExt,
 };
 use tokio::sync::broadcast;
@@ -664,6 +668,60 @@ impl IbClient {
             })?;
         tracing::info!("tick_stream subscribed for {symbol}");
         Ok(TickStream::from_subscription(sub))
+    }
+
+    /// Fetch one-shot historical OHLCV bars for a contract.
+    ///
+    /// # Example (requires a running IB Gateway)
+    /// ```no_run
+    /// # async fn example() -> Result<(), ibcore::IbError> {
+    /// # let ib = ibcore::IbClient::connect(
+    /// #     "127.0.0.1", 4002, 1, "delayed", ibcore::AccountType::Paper
+    /// # ).await?;
+    /// let contract = ibcore::Contract::stock("SPY").build();
+    /// let data = ib.historical_data(
+    ///     &contract,
+    ///     ibcore::BarSize::Hour,
+    ///     ibcore::Duration::days(5),
+    ///     ibcore::WhatToShow::Trades,
+    ///     ibcore::TradingHours::Regular,
+    /// ).await?;
+    /// for bar in &data.bars {
+    ///     println!("O={:.2} H={:.2} L={:.2} C={:.2} V={:.0}",
+    ///         bar.open, bar.high, bar.low, bar.close, bar.volume);
+    /// }
+    /// # ib.disconnect().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn historical_data(
+        &self,
+        contract: &ibapi::contracts::Contract,
+        bar_size: BarSize,
+        duration: Duration,
+        what_to_show: WhatToShow,
+        trading_hours: TradingHours,
+    ) -> Result<HistoricalData, IbError> {
+        let symbol = &contract.symbol;
+        let data = self
+            .inner
+            .historical_data(contract, bar_size)
+            .duration(duration)
+            .what_to_show(what_to_show)
+            .trading_hours(trading_hours)
+            .fetch()
+            .await
+            .map_err(|e| IbError::MarketData {
+                code: 0,
+                message: format!("historical_data fetch failed for {symbol}: {e}"),
+            })?;
+        tracing::info!(
+            "historical_data fetched for {symbol}: {} bars, period {} to {}",
+            data.bars.len(),
+            data.start,
+            data.end,
+        );
+        Ok(data)
     }
 
     /// Fetch NetLiquidation from account summary.
