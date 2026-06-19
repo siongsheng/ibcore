@@ -806,9 +806,31 @@ mod tests {
     /// Validate that TickStream::new() with a oneshot-error stream
     /// produces the correct IbError variant after the client's error
     /// mapping path.
-    #[test]
-    fn tick_stream_error_maps_correctly() {
-        todo!("implement tick_stream error mapping test");
+    #[tokio::test]
+    async fn tick_stream_error_maps_correctly() {
+        use futures::StreamExt;
+        use futures::stream::BoxStream;
+        use ibapi::market_data::realtime::TickTypes;
+        use crate::TickStream;
+
+        // Build a stream that yields one error then ends
+        let stream: BoxStream<'static, Result<TickTypes, ibapi::Error>> =
+            futures::stream::once(async {
+                Err(ibapi::Error::ConnectionReset)
+            })
+            .boxed();
+        let mut ts = TickStream::new(stream);
+
+        // The first item should be the error mapped to IbError
+        let item = ts.next().await;
+        match item {
+            Some(Err(IbError::ConnectionReset)) => {} // expected
+            other => panic!("expected Some(Err(ConnectionReset)), got {other:?}"),
+        }
+
+        // After the error, the stream should be exhausted
+        let next = ts.next().await;
+        assert!(next.is_none(), "expected None after stream ends");
     }
 
     // ── is_connection_dead tests ──
