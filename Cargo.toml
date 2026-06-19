@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
 license = "MIT"
+repository = "https://github.com/siongsheng/ibcore"
+homepage = "https://github.com/siongsheng/ibcore"
+documentation = "https://docs.rs/ibcore"
 
 [workspace]
 members = ["python", "cli"]
