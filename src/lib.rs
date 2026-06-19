@@ -9,6 +9,10 @@
 //!   [`IbClient::pnl`], [`IbClient::net_liquidation`].
 //! - **Option chain resolution** — [`IbClient::fetch_option_chain`] returns
 //!   [`OptionChainData`] (expirations + strikes).
+//! - **Market data streaming** — [`TickEvent`], [`TickStream`] for real-time
+//!   market data ticks via [`IbClient::tick_stream`].
+//! - **Historical data** — [`IbClient::historical_data`] returns [`HistoricalData`]
+//!   with OHLCV [`Bar`]s. Types re-exported from [`historical`] module.
 //! - **Structured errors** — [`IbError`] translates raw IB error codes into typed
 //!   variants instead of letting raw `Notice` codes escape.
 //! - **Diagnostic events** — [`DiagnosticEvent`] emitted via `tokio::sync::broadcast`
@@ -39,6 +43,9 @@ pub mod diagnostics;
 pub mod errors;
 pub mod exchange;
 pub mod contract;
+pub mod orders;
+pub mod streaming;
+pub mod historical;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────
 
@@ -49,10 +56,13 @@ pub use diagnostics::{DiagnosticEvent, FarmState, ConnectionState, AccountType};
 pub use errors::IbError;
 pub use exchange::get_primary_exchange;
 pub use contract::{build_option_contract, parse_expiry};
+pub use streaming::{TickEvent, TickStream};
+pub use historical::{Bar, BarSize, Duration, HistoricalData, WhatToShow, TradingHours};
 
 // ibapi re-exports — so Huat only needs ibcore
-pub use ibapi::contracts::{Contract, OptionRight, SecurityType, LegAction};
+pub use ibapi::contracts::{Contract, OptionRight, SecurityType, LegAction, Symbol};
 pub use ibapi::accounts::{Position, PnL};
-pub use ibapi::orders::{Action, order_builder::{combo_limit_order, combo_market_order}};
+pub use ibapi::orders::{Action, OrderStatusKind, Orders, order_builder::{combo_limit_order, combo_market_order}};
+pub use ibapi::subscriptions::SubscriptionItemStreamExt;
 pub use ibapi::market_data::MarketDataType;
 pub use ibapi::prelude::*;
