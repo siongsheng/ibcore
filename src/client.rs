@@ -673,6 +673,16 @@ where
 mod tests {
     use super::*;
 
+    /// Compile-time check: this won't compile until tick_stream() exists on IbClient.
+    /// The inner function references the method by name; if it's missing, rustc fails.
+    #[test]
+    fn tick_stream_method_exists() {
+        fn _check(ib: &IbClient, c: &ibapi::contracts::Contract) {
+            let _ = ib.tick_stream(c);
+        }
+        let _ = _check;
+    }
+
     // ── is_connection_dead tests ──
 
     #[test]
