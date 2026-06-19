@@ -135,28 +135,25 @@ pip install ibcore
 **Connect and get a stock snapshot**
 
 ```python
-import asyncio
 from ibcore import IbClient
 
-async def main():
-    async with IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper") as ib:
-        snap = await ib.stock_snapshot("SPY")
-        print(f"SPY last: ${snap.last:.2f}, bid: ${snap.bid:.2f}, ask: ${snap.ask:.2f}")
-
-asyncio.run(main())
+ib = IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper")
+snap = ib.stock_snapshot("SPY")
+print(f"SPY last: ${snap.last:.2f}, bid: ${snap.bid:.2f}, ask: ${snap.ask:.2f}")
+ib.disconnect()
 ```
 
 **Get an option snapshot with Greeks**
 
 ```python
-snap = await ib.option_snapshot("SPY", (2025, 7, 17), 570.0, True)
-print(f"delta={snap.option_delta:.4f}, theta={snap.option_theta:.4f}, iv={snap.option_iv:.4f}")
+snap = ib.option_snapshot("SPY", 2025, 7, 17, 570.0, True, "CBOE")
+print(f"delta={snap.delta:.4f}, theta={snap.theta:.4f}, iv={snap.iv:.4f}")
 ```
 
 **Place an order**
 
 ```python
-order_id = await ib.place_order(contract, order)
+order_id = ib.place_order("SPY", "BUY", 100.0, "MKT", None, "SMART")
 print(f"Order placed: {order_id}")
 ```
 
