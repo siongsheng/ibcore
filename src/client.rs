@@ -39,6 +39,7 @@ use crate::{
     exchange::get_primary_exchange,
     chain::OptionChainData,
     snapshots::{OptionSnapshot, StockSnapshot},
+    TickStream,
 };
 
 /// Maximum number of diagnostic events that can be buffered before old ones
@@ -618,6 +619,51 @@ impl IbClient {
             resolved.contract.contract_id,
             resolved.contract.exchange.0.clone(),
         ))
+    }
+
+    /// Subscribe to live market data ticks for a contract.
+    ///
+    /// Returns a [`TickStream`] that yields typed [`TickEvent`]s as they arrive.
+    /// Drop the stream to cancel the IB subscription.
+    ///
+    /// # Example (requires a running IB Gateway)
+    /// ```no_run
+    /// # async fn example() -> Result<(), ibcore::IbError> {
+    /// # let ib = ibcore::IbClient::connect(
+    /// #     "127.0.0.1", 4002, 1, "delayed", ibcore::AccountType::Paper
+    /// # ).await?;
+    /// use futures::StreamExt;
+    ///
+    /// let contract = ibcore::Contract::stock("SPY").build();
+    /// let mut stream = ib.tick_stream(&contract).await?;
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         ibcore::TickEvent::Price { tick_type, price } => {
+    ///             println!("{tick_type:?}: ${price:.2}");
+    ///         }
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # ib.disconnect().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn tick_stream(
+        &self,
+        contract: &ibapi::contracts::Contract,
+    ) -> Result<TickStream, IbError> {
+        let symbol = &contract.symbol;
+        let sub = self
+            .inner
+            .market_data(contract)
+            .subscribe()
+            .await
+            .map_err(|e| IbError::MarketData {
+                code: 0,
+                message: format!("tick_stream subscribe failed for {symbol}: {e}"),
+            })?;
+        tracing::info!("tick_stream subscribed for {symbol}");
+        Ok(TickStream::from_subscription(sub))
     }
 
     /// Fetch NetLiquidation from account summary.
