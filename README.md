@@ -25,7 +25,9 @@ undocumented behavior discovered in live trading is handled here.
 
 ## Quick Start
 
-### Prerequisites
+### Rust
+
+**Prerequisites**
 
 - Rust 1.85+ (edition 2024)
 - IB Gateway or TWS running with API enabled
@@ -113,6 +115,55 @@ let watcher = task::spawn(async move {
         }
     }
 });
+```
+
+### Python
+
+ibcore is also available as a Python package via PyO3 bindings.
+
+**Prerequisites**
+
+- Python 3.9+
+- Rust toolchain (for maturin build)
+
+**Installation**
+
+```bash
+pip install ibcore
+```
+
+**Connect and get a stock snapshot**
+
+```python
+import asyncio
+from ibcore import IbClient
+
+async def main():
+    async with IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper") as ib:
+        snap = await ib.stock_snapshot("SPY")
+        print(f"SPY last: ${snap.last:.2f}, bid: ${snap.bid:.2f}, ask: ${snap.ask:.2f}")
+
+asyncio.run(main())
+```
+
+**Get an option snapshot with Greeks**
+
+```python
+snap = await ib.option_snapshot("SPY", (2025, 7, 17), 570.0, True)
+print(f"delta={snap.option_delta:.4f}, theta={snap.option_theta:.4f}, iv={snap.option_iv:.4f}")
+```
+
+**Place an order**
+
+```python
+order_id = await ib.place_order(contract, order)
+print(f"Order placed: {order_id}")
+```
+
+**Build from source**
+
+```bash
+cd python && pip install maturin && maturin develop --release
 ```
 
 ## CLI Tool
