@@ -76,10 +76,20 @@ println!("SPY strikes: {:?}", chain.strikes);
 ### Get an option snapshot with Greeks
 
 ```rust
-let snap = ib.option_snapshot("SPY", "20260717", 570.0, "C").await?;
+use ibcore::IbClient;
+
+let snap = ib.option_snapshot(
+    "SPY",
+    (2025, 7, 17),  // expiry_ymd: (year, month, day)
+    570.0,           // strike
+    true,            // is_call (true = Call, false = Put)
+    0.0,             // _implied_vol (reserved)
+    0.0,             // _underlying_price (reserved)
+    "CBOE",          // exchange
+).await?;
 println!(
     "SPY 570C: bid={:.2}, ask={:.2}, delta={:.4}, theta={:.4}, iv={:.4}",
-    snap.bid, snap.ask, snap.delta, snap.theta, snap.iv
+    snap.bid, snap.ask, snap.option_delta, snap.option_theta, snap.option_iv
 );
 ```
 
@@ -238,6 +248,78 @@ cargo test --lib
 - **No business logic.** ibcore knows about IBKR, not about trading strategies.
   Position tracking, portfolio allocation, risk management — those belong in
   your application layer.
+
+## Python Bindings
+
+ibcore ships PyO3 Python bindings in the `python/` workspace crate (`ibcore-python`).
+Build the shared library with:
+
+```bash
+# Requires Python 3.7+ and Rust 1.85+
+PYO3_PYTHON=$(which python3) cargo build -p ibcore-python --release
+```
+
+The resulting `.so` file is at `target/release/libibcore_python.so`.
+
+### Usage
+
+```python
+import asyncio
+from ibcore._ibcore import (
+    IbClient, StockSnapshot, OptionSnapshot,
+    DiagnosticEvent, FarmState, ConnectionState,
+    AccountType, DiagnosticEventReceiver,
+)
+
+async def main():
+    # Connect to paper trading Gateway
+    client = await IbClient.connect(
+        "127.0.0.1", 4002, 1, "delayed", "paper",
+    )
+
+    # Stock snapshot
+    snap = await client.stock_snapshot("SPY")
+    print(f"SPY: last={snap.last}, bid={snap.bid}, ask={snap.ask}")
+
+    # Option snapshot
+    opt = await client.option_snapshot(
+        "SPY", 2026, 7, 17, 570.0, True, "CBOE",
+    )
+    print(f"SPY 570C: delta={opt.option_delta}, iv={opt.option_iv}")
+
+    # Account data
+    nl = await client.net_liquidation("")
+    print(f"Net Liq: ${nl:.2f}")
+
+    # Positions
+    positions = await client.positions()
+    for p in positions:
+        print(f"  {p['symbol']}: {p['quantity']} @ {p['avg_cost']}")
+
+    # Diagnostics
+    receiver = client.diagnostic_events()
+    for event in receiver:
+        if event.farm_status == FarmState.WARNING:
+            print(f"⚠️  {event.error_message}")
+
+    await client.disconnect()
+
+asyncio.run(main())
+```
+
+### Async context manager
+
+```python
+async with await IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper") as ib:
+    snap = await ib.stock_snapshot("SPY")
+    print(snap)
+```
+
+### Deferred types (Phase 2)
+
+Streaming (`TickEvent`, `TickStream`), historical data (`Bar`, `HistoricalData`),
+and order management (`OpenOrder`, `OrderStatusEvent`) are deferred to a
+follow-up release.
 
 ## Related
 
