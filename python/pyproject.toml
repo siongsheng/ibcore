@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0"]
+requires = ["maturin>=1.7"]
 build-backend = "maturin"
 
 [project]
@@ -10,19 +10,16 @@ requires-python = ">=3.9"
 readme = "../README.md"
 license = {text = "MIT"}
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Financial and Insurance Industry",
     "Topic :: Office/Business :: Financial :: Investment",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Operating System :: OS Independent",
 ]
-
 [tool.maturin]
-module-name = "ibcore._ibcore"
 features = ["python"]
+module-name = "ibcore._ibcore"
