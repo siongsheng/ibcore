@@ -8,7 +8,7 @@
 //! Order IDs are auto-assigned via [`ibapi::Client::next_valid_order_id`]
 //! — callers never manage raw IDs.
 
-use crate::diagnostics::{ConnectionState, DiagnosticEvent, FarmState};
+use crate::diagnostics::DiagnosticEvent;
 use crate::errors::IbError;
 use crate::IbClient;
 use futures::StreamExt;
