@@ -19,7 +19,10 @@ from ibcore._ibcore import (
     FarmState,
     IbClient,
     IbError,
+    OpenOrder,
     OptionSnapshot,
+    OrderStatusEvent,
+    OrderUpdateReceiver,
     StockSnapshot,
 )
 
@@ -31,6 +34,9 @@ __all__ = [
     "FarmState",
     "IbClient",
     "IbError",
+    "OpenOrder",
     "OptionSnapshot",
+    "OrderStatusEvent",
+    "OrderUpdateReceiver",
     "StockSnapshot",
 ]

@@ -26,6 +26,8 @@ class TestIbClientClass:
             "place_order",
             "cancel_order",
             "diagnostic_events",
+            "open_orders",
+            "order_updates",
         ]
         for method in methods:
             assert hasattr(IbClient, method), f"IbClient missing method: {method}"
