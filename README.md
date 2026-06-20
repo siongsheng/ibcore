@@ -237,6 +237,10 @@ cargo build -p ibkr-diag --release
 | `diagnostic_events()` | `broadcast::Receiver<DiagnosticEvent>` | Subscribe to structured diagnostic events |
 | `server_version()` | `i32` | Gateway server version |
 | `tick_stream(contract)` | `Result<TickStream, IbError>` | Subscribe to live market data ticks |
+| `place_order(symbol, action, quantity, order_type, limit_price, exchange)` | `Result<i32, IbError>` | Place an order; returns order_id |
+| `cancel_order(order_id)` | `Result<(), IbError>` | Cancel an open order |
+| `open_orders()` | `list[dict]` | Snapshot of all open orders |
+| `order_updates()` | `OrderUpdateReceiver` | Subscribe to live order status changes (blocking iterator) |
 | `historical_data(contract, bar_size, duration, what_to_show, trading_hours)` | `Result<HistoricalData, IbError>` | One-shot historical OHLCV bars |
 
 ### `DiagnosticEvent`
@@ -421,12 +425,44 @@ async with await IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper") as i
     print(snap)
 ```
 
-### Deferred types (Phase 2)
+### Order management
 
-Order management (`OpenOrder`, `OrderStatusEvent`) is deferred to a
-follow-up release.
+Open orders and order status updates are accessible via `IbClient.open_orders()` and `IbClient.order_updates()`.
 
-## Related
+```python
+from ibcore import IbClient, OrderStatusEvent
+
+ib = IbClient.connect("127.0.0.1", 4002, 1, "delayed", "paper")
+
+# (A) Fetch current open orders
+open_orders = ib.open_orders()
+for o in open_orders:
+    print(f"Order #{o['order_id']}: {o['action']} {o['quantity']} {o['symbol']} @ {o['limit_price']} [{o['status']}]")
+
+# (B) Subscribe to live order updates
+receiver = ib.order_updates()
+for event in receiver:
+    if event.order_id == 0 and event.commission is not None:
+        print(f"Commission report: ${event.commission:.2f}")
+    elif event.kind == "Filled":
+        print(f"Order #{event.order_id} filled: {event.filled_qty} @ ${event.avg_price:.2f}")
+    elif event.kind == "Rejected":
+        print(f"Order #{event.order_id} rejected: {event.reason}")
+    elif event.kind == "Cancelled":
+        print(f"Order #{event.order_id} cancelled: {event.reason}")
+    # loop exits when receiver is dropped or stream ends (disconnect)
+
+ib.disconnect()
+```
+
+**Notes:**
+- `open_orders()` returns `list[dict]` — one dict per open order, with keys `order_id`, `symbol`, `action`, `quantity`, `order_type`, `limit_price`, `status`, `filled_qty`, `remaining_qty`.
+- `order_updates()` returns an `OrderUpdateReceiver` (iterable). The iterator blocks on `next()` — use a thread wrapper for timeouts.
+- Commission-only events appear as `kind="Filled"`, `order_id=0`, `commission=Some(x.xx)`. Check `event.order_id == 0 and event.commission is not None` to identify them.
+- `KeyboardInterrupt` during `next()` is delayed until the next event arrives.
+- Only one `order_updates()` subscription is allowed per IB Gateway. A second call returns `IbError`.
+
+### Related
 
 - [ibquirk](https://ibquirk.vercel.app) — AI bot that diagnoses IBKR API problems using ibcore's DiagnosticEvents. Join the waitlist.
 
