@@ -989,4 +989,59 @@ mod tests {
         let ib_err: IbError = ibapi::Error::Notice(notice).into();
         assert!(!is_connection_dead(&ib_err));
     }
+
+    // ── contract cache key tests ──
+
+    #[test]
+    fn cache_key_same_contract_produces_same_key() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let c1 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        let c2 = c1.clone();
+        assert_eq!(contract_cache_key(&c1), contract_cache_key(&c2));
+    }
+
+    #[test]
+    fn cache_key_different_symbols_produce_different_keys() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let spy = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        let qqq = Contract {
+            symbol: "QQQ".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        assert_ne!(contract_cache_key(&spy), contract_cache_key(&qqq));
+    }
+
+    #[test]
+    fn cache_key_different_strikes_produce_different_keys() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let opt1 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 400.0,
+            ..Default::default()
+        };
+        let opt2 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 450.0,
+            ..Default::default()
+        };
+        assert_ne!(contract_cache_key(&opt1), contract_cache_key(&opt2));
+    }
 }
