@@ -184,6 +184,127 @@ impl From<ibcore::OpenOrder> for PyOpenOrder {
     }
 }
 
+/// Order status event returned by `IbClient.order_updates()`.
+#[pyclass(name = "OrderStatusEvent")]
+#[derive(Clone)]
+pub struct PyOrderStatusEvent {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    order_id: i32,
+    #[pyo3(get)]
+    filled_qty: f64,
+    #[pyo3(get)]
+    avg_price: f64,
+    #[pyo3(get)]
+    commission: Option<f64>,
+    #[pyo3(get)]
+    reason: String,
+    #[pyo3(get)]
+    status: String,
+}
+
+#[pymethods]
+impl PyOrderStatusEvent {
+    #[new]
+    #[pyo3(signature = (kind="".into(), order_id=0, filled_qty=0.0,
+                        avg_price=0.0, commission=None, reason="".into(),
+                        status="".into()))]
+    fn new(
+        kind: String,
+        order_id: i32,
+        filled_qty: f64,
+        avg_price: f64,
+        commission: Option<f64>,
+        reason: String,
+        status: String,
+    ) -> Self {
+        PyOrderStatusEvent {
+            kind,
+            order_id,
+            filled_qty,
+            avg_price,
+            commission,
+            reason,
+            status,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OrderStatusEvent(kind={:?}, order_id={}, filled_qty={}, avg_price={}, commission={:?}, reason={:?}, status={:?})",
+            self.kind, self.order_id, self.filled_qty, self.avg_price,
+            self.commission, self.reason, self.status,
+        )
+    }
+}
+
+impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
+    fn from(e: ibcore::OrderStatusEvent) -> Self {
+        match e {
+            ibcore::OrderStatusEvent::Submitted { order_id } => PyOrderStatusEvent {
+                kind: "Submitted".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Filled {
+                order_id,
+                filled_qty,
+                avg_price,
+                commission,
+            } => PyOrderStatusEvent {
+                kind: "Filled".into(),
+                order_id,
+                filled_qty,
+                avg_price,
+                commission,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Cancelled { order_id, reason } => PyOrderStatusEvent {
+                kind: "Cancelled".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason,
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Inactive { order_id } => PyOrderStatusEvent {
+                kind: "Inactive".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Rejected { order_id, reason } => PyOrderStatusEvent {
+                kind: "Rejected".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason,
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Other { order_id, status } => PyOrderStatusEvent {
+                kind: "Other".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status,
+            },
+        }
+    }
+}
+
 /// Structured diagnostic event from IB Gateway notice stream.
 #[pyclass(name = "DiagnosticEvent")]
 #[derive(Clone)]
