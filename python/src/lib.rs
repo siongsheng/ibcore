@@ -1243,6 +1243,8 @@ mod tests {
             assert!(cls.getattr("server_version").is_ok());
             assert!(cls.getattr("account_type").is_ok());
             assert!(cls.getattr("diagnostic_events").is_ok());
+            assert!(cls.getattr("open_orders").is_ok());
+            assert!(cls.getattr("order_updates").is_ok());
             Ok(())
         })
     }
