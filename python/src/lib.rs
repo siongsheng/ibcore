@@ -948,6 +948,9 @@ fn _ibcore(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIbError>()?;
     m.add_class::<PyIbClient>()?;
     m.add_class::<PyDiagnosticEventReceiver>()?;
+    m.add_class::<PyOpenOrder>()?;
+    m.add_class::<PyOrderStatusEvent>()?;
+    m.add_class::<PyOrderUpdateReceiver>()?;
     Ok(())
 }
 
