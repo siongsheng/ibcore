@@ -1,6 +1,6 @@
 [package]
 name = "ibcore"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
 license = "MIT"

@@ -428,7 +428,7 @@ follow-up release.
 
 ## Related
 
-- [ibquirk](https://ibquirk-site.vercel.app) — AI bot that diagnoses IBKR API problems using ibcore's DiagnosticEvents. Join the waitlist.
+- [ibquirk](https://ibquirk.vercel.app) — AI bot that diagnoses IBKR API problems using ibcore's DiagnosticEvents. Join the waitlist.
 
 ## License
 

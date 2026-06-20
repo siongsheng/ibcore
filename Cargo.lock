@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "ibcore"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "futures",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "ibcore-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "ibapi",

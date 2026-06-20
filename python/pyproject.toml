@@ -3,8 +3,8 @@ requires = ["maturin>=1.7"]
 build-backend = "maturin"
 
 [project]
-name = "ibcore"
-version = "0.1.0"
+name = "ibcore-py"
+version = "0.1.1"
 description = "Standalone IB Gateway integration — market data snapshots, diagnostics, order placement"
 requires-python = ">=3.9"
 readme = "../README.md"
@@ -21,5 +21,4 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 [tool.maturin]
-features = ["python"]
 module-name = "ibcore._ibcore"
