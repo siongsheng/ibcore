@@ -1248,4 +1248,133 @@ mod tests {
         assert_eq!(py.symbol, "AAPL");
         assert!(py.limit_price.is_none());
     }
+
+    // ── PyOrderStatusEvent tests ──
+
+    #[test]
+    fn order_status_event_construct_via_new() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Filled", 42, 50.0, 450.25, 1.50, "", ""))?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "Filled");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 42);
+            assert_eq!(e.getattr("filled_qty")?.extract::<f64>()?, 50.0);
+            assert_eq!(e.getattr("commission")?.extract::<Option<f64>>()?, Some(1.50));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_default_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call0()?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 0);
+            assert!(e.getattr("commission")?.extract::<Option<f64>>()?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_partial_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Submitted", 99))?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "Submitted");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 99);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_repr() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Cancelled", 55))?;
+            let repr_str = e.call_method0("__repr__")?.extract::<String>()?;
+            assert!(repr_str.contains("OrderStatusEvent"));
+            assert!(repr_str.contains("Cancelled"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_commission_only() {
+        let rust = ibcore::OrderStatusEvent::Filled {
+            order_id: 0,
+            filled_qty: 0.0,
+            avg_price: 0.0,
+            commission: Some(1.50),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Filled");
+        assert_eq!(py.order_id, 0);
+        assert_eq!(py.commission, Some(1.50));
+    }
+
+    #[test]
+    fn order_status_event_from_submitted() {
+        let rust = ibcore::OrderStatusEvent::Submitted { order_id: 10 };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Submitted");
+        assert_eq!(py.order_id, 10);
+        assert_eq!(py.reason, "");
+    }
+
+    #[test]
+    fn order_status_event_from_filled() {
+        let rust = ibcore::OrderStatusEvent::Filled {
+            order_id: 20,
+            filled_qty: 100.0,
+            avg_price: 450.0,
+            commission: None,
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Filled");
+        assert_eq!(py.filled_qty, 100.0);
+        assert_eq!(py.avg_price, 450.0);
+        assert!(py.commission.is_none());
+    }
+
+    #[test]
+    fn order_status_event_from_cancelled() {
+        let rust = ibcore::OrderStatusEvent::Cancelled {
+            order_id: 30,
+            reason: "user requested".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Cancelled");
+        assert_eq!(py.reason, "user requested");
+    }
+
+    #[test]
+    fn order_status_event_from_rejected() {
+        let rust = ibcore::OrderStatusEvent::Rejected {
+            order_id: 40,
+            reason: "insufficient funds".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Rejected");
+        assert_eq!(py.reason, "insufficient funds");
+    }
+
+    #[test]
+    fn order_status_event_from_inactive() {
+        let rust = ibcore::OrderStatusEvent::Inactive { order_id: 50 };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Inactive");
+        assert_eq!(py.order_id, 50);
+    }
+
+    #[test]
+    fn order_status_event_from_other() {
+        let rust = ibcore::OrderStatusEvent::Other {
+            order_id: 60,
+            status: "ApiPending".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Other");
+        assert_eq!(py.status, "ApiPending");
+    }
 }
