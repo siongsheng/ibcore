@@ -1099,4 +1099,73 @@ mod tests {
             assert_eq!(cat, expected_cat, "mismatch for {err}");
         }
     }
+
+    // ── PyOpenOrder tests ──
+
+    #[test]
+    fn open_order_construct_via_new() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((1, "SPY", "BUY", 100.0, "LMT", 450.0, "Submitted", 0.0, 100.0))?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 1);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "SPY");
+            assert_eq!(o.getattr("action")?.extract::<String>()?, "BUY");
+            assert!((o.getattr("quantity")?.extract::<f64>()? - 100.0).abs() < 0.001);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_default_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call0()?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 0);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "");
+            assert!(o.getattr("limit_price")?.extract::<Option<f64>>()?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_partial_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((42, "QQQ"))?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 42);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "QQQ");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_repr() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((1, "SPY", "BUY", 100.0, "LMT", py.None(), "Submitted", 0.0, 100.0))?;
+            let repr_str = o.call_method0("__repr__")?.extract::<String>()?;
+            assert!(repr_str.contains("OpenOrder"));
+            assert!(repr_str.contains("SPY"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_from_rust_type() {
+        let rust = ibcore::OpenOrder {
+            order_id: 10,
+            symbol: "AAPL".into(),
+            action: "SELL".into(),
+            quantity: 50.0,
+            order_type: "MKT".into(),
+            limit_price: None,
+            status: "Submitted".into(),
+            filled_qty: 0.0,
+            remaining_qty: 50.0,
+        };
+        let py: PyOpenOrder = rust.into();
+        assert_eq!(py.order_id, 10);
+        assert_eq!(py.symbol, "AAPL");
+        assert!(py.limit_price.is_none());
+    }
 }
