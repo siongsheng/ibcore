@@ -729,6 +729,72 @@ impl PyIbClient {
         })
     }
 
+    // ── Order methods ──
+
+    fn open_orders(&self, py: Python<'_>) -> PyResult<PyObject> {
+        with_client(&self.inner, |client| {
+            let orders = self
+                .rt
+                .block_on(client.open_orders())
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let py_list = orders
+                .into_iter()
+                .map(|o| {
+                    let od = PyDict::new(py);
+                    od.set_item("order_id", o.order_id).unwrap();
+                    od.set_item("symbol", o.symbol).unwrap();
+                    od.set_item("action", o.action).unwrap();
+                    od.set_item("quantity", o.quantity).unwrap();
+                    od.set_item("order_type", o.order_type).unwrap();
+                    if let Some(price) = o.limit_price {
+                        od.set_item("limit_price", price).unwrap();
+                    } else {
+                        od.set_item("limit_price", py.None()).unwrap();
+                    }
+                    od.set_item("status", o.status).unwrap();
+                    od.set_item("filled_qty", o.filled_qty).unwrap();
+                    od.set_item("remaining_qty", o.remaining_qty).unwrap();
+                    od.into()
+                })
+                .collect::<Vec<PyObject>>();
+            Ok(PyList::new(py, py_list)?.into())
+        })
+    }
+
+    fn order_updates(&self) -> PyResult<PyOrderUpdateReceiver> {
+        with_client(&self.inner, |client| {
+            let mut stream = self
+                .rt
+                .block_on(client.order_updates())
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PyOrderStatusEvent>(1024);
+            let handle = tokio::task::spawn(async move {
+                loop {
+                    match stream.next().await {
+                        Some(Ok(event)) => {
+                            let py_event = PyOrderStatusEvent::from(event);
+                            match tx.try_send(py_event) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    tracing::warn!("order update channel full, dropping event");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(%e, "order update stream error, continuing");
+                        }
+                        None => break,
+                    }
+                }
+            });
+            Ok(PyOrderUpdateReceiver {
+                rx: std::sync::Mutex::new(rx),
+                _task: Some(handle),
+            })
+        })
+    }
+
     // ── Properties ──
 
     #[getter]
