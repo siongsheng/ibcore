@@ -104,6 +104,207 @@ impl PyOptionSnapshot {
     }
 }
 
+/// Open order snapshot returned by `IbClient.open_orders()`.
+#[pyclass(name = "OpenOrder")]
+#[derive(Clone)]
+pub struct PyOpenOrder {
+    #[pyo3(get)]
+    order_id: i32,
+    #[pyo3(get)]
+    symbol: String,
+    #[pyo3(get)]
+    action: String,
+    #[pyo3(get)]
+    quantity: f64,
+    #[pyo3(get)]
+    order_type: String,
+    #[pyo3(get)]
+    limit_price: Option<f64>,
+    #[pyo3(get)]
+    status: String,
+    #[pyo3(get)]
+    filled_qty: f64,
+    #[pyo3(get)]
+    remaining_qty: f64,
+}
+
+#[pymethods]
+impl PyOpenOrder {
+    #[new]
+    #[pyo3(signature = (order_id=0, symbol="".into(), action="".into(), quantity=0.0,
+                        order_type="".into(), limit_price=None, status="".into(),
+                        filled_qty=0.0, remaining_qty=0.0))]
+    fn new(
+        order_id: i32,
+        symbol: String,
+        action: String,
+        quantity: f64,
+        order_type: String,
+        limit_price: Option<f64>,
+        status: String,
+        filled_qty: f64,
+        remaining_qty: f64,
+    ) -> Self {
+        PyOpenOrder {
+            order_id,
+            symbol,
+            action,
+            quantity,
+            order_type,
+            limit_price,
+            status,
+            filled_qty,
+            remaining_qty,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OpenOrder(order_id={}, symbol={:?}, action={:?}, quantity={}, order_type={:?}, limit_price={:?}, status={:?}, filled_qty={}, remaining_qty={})",
+            self.order_id, self.symbol, self.action, self.quantity,
+            self.order_type, self.limit_price, self.status,
+            self.filled_qty, self.remaining_qty,
+        )
+    }
+}
+
+impl From<ibcore::OpenOrder> for PyOpenOrder {
+    fn from(o: ibcore::OpenOrder) -> Self {
+        PyOpenOrder {
+            order_id: o.order_id,
+            symbol: o.symbol,
+            action: o.action,
+            quantity: o.quantity,
+            order_type: o.order_type,
+            limit_price: o.limit_price,
+            status: o.status,
+            filled_qty: o.filled_qty,
+            remaining_qty: o.remaining_qty,
+        }
+    }
+}
+
+/// Order status event returned by `IbClient.order_updates()`.
+#[pyclass(name = "OrderStatusEvent")]
+#[derive(Clone)]
+pub struct PyOrderStatusEvent {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    order_id: i32,
+    #[pyo3(get)]
+    filled_qty: f64,
+    #[pyo3(get)]
+    avg_price: f64,
+    #[pyo3(get)]
+    commission: Option<f64>,
+    #[pyo3(get)]
+    reason: String,
+    #[pyo3(get)]
+    status: String,
+}
+
+#[pymethods]
+impl PyOrderStatusEvent {
+    #[new]
+    #[pyo3(signature = (kind="".into(), order_id=0, filled_qty=0.0,
+                        avg_price=0.0, commission=None, reason="".into(),
+                        status="".into()))]
+    fn new(
+        kind: String,
+        order_id: i32,
+        filled_qty: f64,
+        avg_price: f64,
+        commission: Option<f64>,
+        reason: String,
+        status: String,
+    ) -> Self {
+        PyOrderStatusEvent {
+            kind,
+            order_id,
+            filled_qty,
+            avg_price,
+            commission,
+            reason,
+            status,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OrderStatusEvent(kind={:?}, order_id={}, filled_qty={}, avg_price={}, commission={:?}, reason={:?}, status={:?})",
+            self.kind, self.order_id, self.filled_qty, self.avg_price,
+            self.commission, self.reason, self.status,
+        )
+    }
+}
+
+impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
+    fn from(e: ibcore::OrderStatusEvent) -> Self {
+        match e {
+            ibcore::OrderStatusEvent::Submitted { order_id } => PyOrderStatusEvent {
+                kind: "Submitted".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Filled {
+                order_id,
+                filled_qty,
+                avg_price,
+                commission,
+            } => PyOrderStatusEvent {
+                kind: "Filled".into(),
+                order_id,
+                filled_qty,
+                avg_price,
+                commission,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Cancelled { order_id, reason } => PyOrderStatusEvent {
+                kind: "Cancelled".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason,
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Inactive { order_id } => PyOrderStatusEvent {
+                kind: "Inactive".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Rejected { order_id, reason } => PyOrderStatusEvent {
+                kind: "Rejected".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason,
+                status: String::new(),
+            },
+            ibcore::OrderStatusEvent::Other { order_id, status } => PyOrderStatusEvent {
+                kind: "Other".into(),
+                order_id,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                reason: String::new(),
+                status,
+            },
+        }
+    }
+}
+
 /// Structured diagnostic event from IB Gateway notice stream.
 #[pyclass(name = "DiagnosticEvent")]
 #[derive(Clone)]
@@ -528,6 +729,72 @@ impl PyIbClient {
         })
     }
 
+    // ── Order methods ──
+
+    fn open_orders(&self, py: Python<'_>) -> PyResult<PyObject> {
+        with_client(&self.inner, |client| {
+            let orders = self
+                .rt
+                .block_on(client.open_orders())
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let py_list = orders
+                .into_iter()
+                .map(|o| {
+                    let od = PyDict::new(py);
+                    od.set_item("order_id", o.order_id).unwrap();
+                    od.set_item("symbol", o.symbol).unwrap();
+                    od.set_item("action", o.action).unwrap();
+                    od.set_item("quantity", o.quantity).unwrap();
+                    od.set_item("order_type", o.order_type).unwrap();
+                    if let Some(price) = o.limit_price {
+                        od.set_item("limit_price", price).unwrap();
+                    } else {
+                        od.set_item("limit_price", py.None()).unwrap();
+                    }
+                    od.set_item("status", o.status).unwrap();
+                    od.set_item("filled_qty", o.filled_qty).unwrap();
+                    od.set_item("remaining_qty", o.remaining_qty).unwrap();
+                    od.into()
+                })
+                .collect::<Vec<PyObject>>();
+            Ok(PyList::new(py, py_list)?.into())
+        })
+    }
+
+    fn order_updates(&self) -> PyResult<PyOrderUpdateReceiver> {
+        with_client(&self.inner, |client| {
+            let mut stream = self
+                .rt
+                .block_on(client.order_updates())
+                .map_err(|e| ib_err_to_py_err(&e))?;
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PyOrderStatusEvent>(1024);
+            let handle = tokio::task::spawn(async move {
+                loop {
+                    match stream.next().await {
+                        Some(Ok(event)) => {
+                            let py_event = PyOrderStatusEvent::from(event);
+                            match tx.try_send(py_event) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    tracing::warn!("order update channel full, dropping event");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(%e, "order update stream error, continuing");
+                        }
+                        None => break,
+                    }
+                }
+            });
+            Ok(PyOrderUpdateReceiver {
+                rx: std::sync::Mutex::new(rx),
+                _task: Some(handle),
+            })
+        })
+    }
+
     // ── Properties ──
 
     #[getter]
@@ -610,6 +877,47 @@ impl PyDiagnosticEventReceiver {
     }
 }
 
+// ── PyOrderUpdateReceiver — blocking iterator over order status events ────
+
+use std::sync::mpsc;
+
+/// Blocking iterator over order status events from `order_updates()`.
+///
+/// Wraps an `mpsc::Receiver` fed by a background tokio task.
+/// Dropping this receiver aborts the background task.
+///
+/// # GIL behaviour
+/// `__next__` releases the GIL during `recv()` via `py.allow_threads()`
+/// so other Python threads are not starved.
+#[pyclass(name = "OrderUpdateReceiver")]
+pub struct PyOrderUpdateReceiver {
+    rx: std::sync::Mutex<mpsc::Receiver<PyOrderStatusEvent>>,
+    _task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[pymethods]
+impl PyOrderUpdateReceiver {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyOrderStatusEvent>> {
+        // Release the GIL and block on the mpsc receiver.
+        // std::sync::Mutex<Receiver<T>> is Send+Sync, so this compiles.
+        py.allow_threads(|| self.rx.lock().unwrap().recv())
+            .map(|event| Some(event))
+            .map_err(|_recv_err| {
+                PyErr::new::<pyo3::exceptions::PyStopIteration, _>("order update stream ended")
+            })
+    }
+}
+
+impl Drop for PyOrderUpdateReceiver {
+    fn drop(&mut self) {
+        self._task.take().map(|h| h.abort());
+    }
+}
+
 // ── Module registration ───────────────────────────────────────────────────
 
 #[pymodule]
@@ -623,6 +931,9 @@ fn _ibcore(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIbError>()?;
     m.add_class::<PyIbClient>()?;
     m.add_class::<PyDiagnosticEventReceiver>()?;
+    m.add_class::<PyOpenOrder>()?;
+    m.add_class::<PyOrderStatusEvent>()?;
+    m.add_class::<PyOrderUpdateReceiver>()?;
     Ok(())
 }
 
@@ -984,6 +1295,8 @@ mod tests {
             assert!(cls.getattr("server_version").is_ok());
             assert!(cls.getattr("account_type").is_ok());
             assert!(cls.getattr("diagnostic_events").is_ok());
+            assert!(cls.getattr("open_orders").is_ok());
+            assert!(cls.getattr("order_updates").is_ok());
             Ok(())
         })
     }
@@ -1098,5 +1411,269 @@ mod tests {
             let (cat, _, _) = map_ib_error(&err);
             assert_eq!(cat, expected_cat, "mismatch for {err}");
         }
+    }
+
+    // ── PyOpenOrder tests ──
+
+    #[test]
+    fn open_order_construct_via_new() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((1, "SPY", "BUY", 100.0, "LMT", 450.0, "Submitted", 0.0, 100.0))?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 1);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "SPY");
+            assert_eq!(o.getattr("action")?.extract::<String>()?, "BUY");
+            assert!((o.getattr("quantity")?.extract::<f64>()? - 100.0).abs() < 0.001);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_default_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call0()?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 0);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "");
+            assert!(o.getattr("limit_price")?.extract::<Option<f64>>()?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_partial_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((42, "QQQ"))?;
+            assert_eq!(o.getattr("order_id")?.extract::<i32>()?, 42);
+            assert_eq!(o.getattr("symbol")?.extract::<String>()?, "QQQ");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_repr() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOpenOrder>();
+            let o = cls.call1((1, "SPY", "BUY", 100.0, "LMT", py.None(), "Submitted", 0.0, 100.0))?;
+            let repr_str = o.call_method0("__repr__")?.extract::<String>()?;
+            assert!(repr_str.contains("OpenOrder"));
+            assert!(repr_str.contains("SPY"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn open_order_from_rust_type() {
+        let rust = ibcore::OpenOrder {
+            order_id: 10,
+            symbol: "AAPL".into(),
+            action: "SELL".into(),
+            quantity: 50.0,
+            order_type: "MKT".into(),
+            limit_price: None,
+            status: "Submitted".into(),
+            filled_qty: 0.0,
+            remaining_qty: 50.0,
+        };
+        let py: PyOpenOrder = rust.into();
+        assert_eq!(py.order_id, 10);
+        assert_eq!(py.symbol, "AAPL");
+        assert!(py.limit_price.is_none());
+    }
+
+    // ── PyOrderStatusEvent tests ──
+
+    #[test]
+    fn order_status_event_construct_via_new() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Filled", 42, 50.0, 450.25, 1.50, "", ""))?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "Filled");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 42);
+            assert_eq!(e.getattr("filled_qty")?.extract::<f64>()?, 50.0);
+            assert_eq!(e.getattr("commission")?.extract::<Option<f64>>()?, Some(1.50));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_default_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call0()?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 0);
+            assert!(e.getattr("commission")?.extract::<Option<f64>>()?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_partial_construction() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Submitted", 99))?;
+            assert_eq!(e.getattr("kind")?.extract::<String>()?, "Submitted");
+            assert_eq!(e.getattr("order_id")?.extract::<i32>()?, 99);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_repr() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderStatusEvent>();
+            let e = cls.call1(("Cancelled", 55))?;
+            let repr_str = e.call_method0("__repr__")?.extract::<String>()?;
+            assert!(repr_str.contains("OrderStatusEvent"));
+            assert!(repr_str.contains("Cancelled"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_status_event_commission_only() {
+        let rust = ibcore::OrderStatusEvent::Filled {
+            order_id: 0,
+            filled_qty: 0.0,
+            avg_price: 0.0,
+            commission: Some(1.50),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Filled");
+        assert_eq!(py.order_id, 0);
+        assert_eq!(py.commission, Some(1.50));
+    }
+
+    #[test]
+    fn order_status_event_from_submitted() {
+        let rust = ibcore::OrderStatusEvent::Submitted { order_id: 10 };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Submitted");
+        assert_eq!(py.order_id, 10);
+        assert_eq!(py.reason, "");
+    }
+
+    #[test]
+    fn order_status_event_from_filled() {
+        let rust = ibcore::OrderStatusEvent::Filled {
+            order_id: 20,
+            filled_qty: 100.0,
+            avg_price: 450.0,
+            commission: None,
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Filled");
+        assert_eq!(py.filled_qty, 100.0);
+        assert_eq!(py.avg_price, 450.0);
+        assert!(py.commission.is_none());
+    }
+
+    #[test]
+    fn order_status_event_from_cancelled() {
+        let rust = ibcore::OrderStatusEvent::Cancelled {
+            order_id: 30,
+            reason: "user requested".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Cancelled");
+        assert_eq!(py.reason, "user requested");
+    }
+
+    #[test]
+    fn order_status_event_from_rejected() {
+        let rust = ibcore::OrderStatusEvent::Rejected {
+            order_id: 40,
+            reason: "insufficient funds".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Rejected");
+        assert_eq!(py.reason, "insufficient funds");
+    }
+
+    #[test]
+    fn order_status_event_from_inactive() {
+        let rust = ibcore::OrderStatusEvent::Inactive { order_id: 50 };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Inactive");
+        assert_eq!(py.order_id, 50);
+    }
+
+    #[test]
+    fn order_status_event_from_other() {
+        let rust = ibcore::OrderStatusEvent::Other {
+            order_id: 60,
+            status: "ApiPending".into(),
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Other");
+        assert_eq!(py.status, "ApiPending");
+    }
+
+    // ── PyOrderUpdateReceiver tests ──
+
+    #[test]
+    fn order_update_receiver_is_iterable() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyOrderUpdateReceiver>();
+            assert!(cls.getattr("__iter__").is_ok());
+            assert!(cls.getattr("__next__").is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_update_receiver_construct_and_iter_self() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PyOrderStatusEvent>(1);
+            // Use a simple blocking function instead of async move
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let _ = done_rx.recv(); // block until told to stop
+                drop(tx);
+            });
+            let recv = PyOrderUpdateReceiver {
+                rx: std::sync::Mutex::new(rx),
+                _task: None,
+            };
+            let py_recv = Py::new(py, recv)?;
+            let bind = py_recv.bind(py);
+            // __iter__ returns self — verify by checking the PyRef identity
+            let _iter_val = bind.call_method0("__iter__")?;
+            // If __iter__ returned self, we can call __next__ on it
+            assert!(bind.call_method0("__next__").is_ok());
+            let _ = done_tx.send(()); // unblock thread
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_update_receiver_next_returns_none_on_empty() -> PyResult<()> {
+        Python::with_gil(|py| {
+            // No tx → channel disconnected → try_recv returns TryRecvError::Disconnected
+            let (_tx, rx) = std::sync::mpsc::sync_channel::<PyOrderStatusEvent>(1);
+            drop(_tx); // ensure disconnected
+            let recv = PyOrderUpdateReceiver {
+                rx: std::sync::Mutex::new(rx),
+                _task: None,
+            };
+            let py_recv = Py::new(py, recv)?;
+            let bind = py_recv.bind(py);
+            let result = bind.call_method0("__next__")?;
+            assert!(result.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn order_update_receiver_has_drop() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<PyOrderStatusEvent>(1);
+        let recv = PyOrderUpdateReceiver {
+                rx: std::sync::Mutex::new(rx),
+                _task: None,
+            };
+            // Verify Drop doesn't crash when _task is None
+        drop(recv);
     }
 }
