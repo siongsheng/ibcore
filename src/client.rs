@@ -50,12 +50,28 @@ use crate::{
 /// are dropped for slow subscribers.
 const DIAGNOSTIC_BUFFER: usize = 256;
 
+use std::collections::HashMap;
+
+/// Build a cache key from an IB contract's identifying fields.
+fn contract_cache_key(c: &ibapi::contracts::Contract) -> String {
+    format!(
+        "{}|{:?}|{}|{}|{}|{:?}",
+        c.symbol,
+        c.security_type,
+        c.exchange,
+        c.last_trade_date_or_contract_month,
+        c.strike,
+        c.right
+    )
+}
+
 /// Persistent IB Gateway client with snapshot helpers and diagnostic events.
 pub struct IbClient {
     inner: Arc<ibapi::Client>,
     account_type: AccountType,
     diagnostic_tx: broadcast::Sender<DiagnosticEvent>,
     _diagnostic_task: tokio::task::JoinHandle<()>,
+    contract_cache: tokio::sync::Mutex<HashMap<String, Vec<ibapi::contracts::ContractDetails>>>,
 }
 
 /// Check if an error indicates the IB Gateway connection is dead.
@@ -78,7 +94,33 @@ impl IbClient {
         self.inner.server_version()
     }
 
-    /// Subscribe to the diagnostic event stream.
+    /// Fetch contract_details with caching.
+    ///
+    /// Checks the in-memory cache before calling the IB API. Cache is keyed
+    /// by (symbol, security_type, exchange, expiry, strike, right).
+    /// Cleared on reconnect.
+    async fn cached_contract_details(
+        &self,
+        contract: &ibapi::contracts::Contract,
+    ) -> Result<Vec<ibapi::contracts::ContractDetails>, ibapi::Error> {
+        let key = contract_cache_key(contract);
+        {
+            let cache = self.contract_cache.lock().await;
+            if let Some(details) = cache.get(&key) {
+                tracing::debug!("contract_details cache hit: {key}");
+                return Ok(details.clone());
+            }
+        }
+        let details = self.inner.contract_details(contract).await?;
+        if !details.is_empty() {
+            let mut cache = self.contract_cache.lock().await;
+            cache.insert(key, details.clone());
+        }
+        Ok(details)
+    }
+
+
+        /// Subscribe to the diagnostic event stream.
     ///
     /// Returns a receiver that will see all future [`DiagnosticEvent`]s emitted
     /// by the background notice-stream watcher. Late subscribers miss earlier
@@ -162,6 +204,7 @@ impl IbClient {
             account_type,
             diagnostic_tx,
             _diagnostic_task,
+            contract_cache: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -245,6 +288,7 @@ impl IbClient {
         });
 
         self.inner = inner;
+        self.contract_cache = tokio::sync::Mutex::new(HashMap::new());
         Ok(())
     }
 
@@ -409,7 +453,7 @@ impl IbClient {
         for ex in &exchanges_to_try {
             let mut c = contract.clone();
             c.exchange = ex.as_str().into();
-            match self.inner.contract_details(&c).await {
+            match self.cached_contract_details(&c).await {
                 Ok(d) if !d.is_empty() => {
                     details = Some(d);
                     break;
@@ -524,7 +568,7 @@ impl IbClient {
             } else {
                 Contract::stock(symbol).on_exchange(*exchange).build()
             };
-            match self.inner.contract_details(&contract).await {
+            match self.cached_contract_details(&contract).await {
                 Ok(details) => {
                     if let Some(d) = details.first() {
                         conid = d.contract.contract_id;
@@ -607,8 +651,7 @@ impl IbClient {
         let expiry_str = format!("{year:04}{month:02}{day:02}");
 
         let details = self
-            .inner
-            .contract_details(&contract)
+            .cached_contract_details(&contract)
             .await
             .map_err(|e| {
                 IbError::ContractResolution(format!(
@@ -945,5 +988,60 @@ mod tests {
         };
         let ib_err: IbError = ibapi::Error::Notice(notice).into();
         assert!(!is_connection_dead(&ib_err));
+    }
+
+    // ── contract cache key tests ──
+
+    #[test]
+    fn cache_key_same_contract_produces_same_key() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let c1 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        let c2 = c1.clone();
+        assert_eq!(contract_cache_key(&c1), contract_cache_key(&c2));
+    }
+
+    #[test]
+    fn cache_key_different_symbols_produce_different_keys() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let spy = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        let qqq = Contract {
+            symbol: "QQQ".into(),
+            security_type: SecurityType::Stock,
+            exchange: "SMART".into(),
+            ..Default::default()
+        };
+        assert_ne!(contract_cache_key(&spy), contract_cache_key(&qqq));
+    }
+
+    #[test]
+    fn cache_key_different_strikes_produce_different_keys() {
+        use ibapi::contracts::{Contract, SecurityType};
+        let opt1 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 400.0,
+            ..Default::default()
+        };
+        let opt2 = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 450.0,
+            ..Default::default()
+        };
+        assert_ne!(contract_cache_key(&opt1), contract_cache_key(&opt2));
     }
 }
