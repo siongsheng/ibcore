@@ -311,7 +311,15 @@ impl IbClient {
     }
 
     /// Get a market data snapshot for a stock or index.
+    ///
+    /// Retries up to 3 times with exponential backoff when the snapshot returns
+    /// all-zero bid/ask/last prices (competing live session blocking paper data).
     pub async fn stock_snapshot(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
+        retry_market_data(|| self.stock_snapshot_inner(symbol)).await
+    }
+
+    /// Single stock snapshot attempt — no retry.
+    async fn stock_snapshot_inner(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
         let contract = if symbol == "VIX" {
             Contract {
                 symbol: symbol.into(),
@@ -738,24 +746,39 @@ impl IbClient {
 
 // ── Free helper functions ──
 
+/// Trait for snapshots that can detect zero-price data (competing session).
+trait IsZeroPriced {
+    fn is_zero_priced(&self) -> bool;
+}
+
+impl IsZeroPriced for StockSnapshot {
+    fn is_zero_priced(&self) -> bool {
+        self.bid <= 0.0 && self.ask <= 0.0 && self.last <= 0.0
+    }
+}
+
+impl IsZeroPriced for OptionSnapshot {
+    fn is_zero_priced(&self) -> bool {
+        self.bid <= 0.0 && self.ask <= 0.0 && self.last <= 0.0
+    }
+}
+
 /// Retry a snapshot with exponential backoff when all prices are zero.
 ///
 /// Error 10197 ("competing live session") causes IB to return empty market data
 /// on paper accounts when a live Gateway is also connected. Retrying with delay
 /// gives the market data stream time to recover.
-async fn retry_snapshot<F, Fut>(mut fetch: F) -> Result<OptionSnapshot, IbError>
+async fn retry_market_data<T, F, Fut>(mut fetch: F) -> Result<T, IbError>
 where
+    T: IsZeroPriced,
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<OptionSnapshot, IbError>>,
+    Fut: std::future::Future<Output = Result<T, IbError>>,
 {
     for attempt in 0..3 {
         let snap = fetch().await?;
-        let is_zero = snap.bid <= 0.0 && snap.ask <= 0.0 && snap.last <= 0.0;
-
-        if !is_zero {
+        if !snap.is_zero_priced() {
             return Ok(snap);
         }
-
         let delay_ms = 1000 * (1 << attempt);
         tracing::warn!(
             "empty market data (attempt {}/3, competing session?) — retrying in {}s",
@@ -764,13 +787,21 @@ where
         );
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
-
     tracing::error!(
         "market data persistently empty after 3 retries — \
          competing live session likely blocking paper data. \
          Stop the live Gateway (port 4001) or use delayed market data."
     );
     Err(IbError::CompetingSession)
+}
+
+/// Retry a snapshot — delegates to [`retry_market_data`].
+async fn retry_snapshot<F, Fut>(fetch: F) -> Result<OptionSnapshot, IbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<OptionSnapshot, IbError>>,
+{
+    retry_market_data(fetch).await
 }
 
 #[cfg(test)]
