@@ -889,16 +889,6 @@ use std::sync::mpsc;
 /// # GIL behaviour
 /// `__next__` releases the GIL during `recv()` via `py.allow_threads()`
 /// so other Python threads are not starved.
-///
-/// # GIL_FALLBACK:
-/// If `py.allow_threads(|| self.rx.recv())` proves broken, replace with:
-///   loop {
-///       match self.rx.try_recv() {
-///           Ok(event) => return Ok(Some(event)),
-///           Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
-///           Err(TryRecvError::Disconnected) => return Ok(None),
-///       }
-///   }
 #[pyclass(name = "OrderUpdateReceiver")]
 pub struct PyOrderUpdateReceiver {
     rx: std::sync::Mutex<mpsc::Receiver<PyOrderStatusEvent>>,
@@ -912,20 +902,13 @@ impl PyOrderUpdateReceiver {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyOrderStatusEvent>> {
-        // GIL_FALLBACK: uses try_recv + sleep loop because py.allow_threads(|| self.rx.recv())
-        // has a Send/Sync conflict with mpsc::Receiver (which is !Sync even though Send).
-        // If a future PyO3 version resolves this, switch to:
-        //   py.allow_threads(|| self.rx.recv())
-        loop {
-            match self.rx.lock().unwrap().try_recv() {
-                Ok(event) => return Ok(Some(event)),
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Release GIL briefly so other Python threads can run
-                    py.allow_threads(|| std::thread::sleep(std::time::Duration::from_millis(10)));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => return Ok(None),
-            }
-        }
+        // Release the GIL and block on the mpsc receiver.
+        // std::sync::Mutex<Receiver<T>> is Send+Sync, so this compiles.
+        py.allow_threads(|| self.rx.lock().unwrap().recv())
+            .map(|event| Some(event))
+            .map_err(|_recv_err| {
+                PyErr::new::<pyo3::exceptions::PyStopIteration, _>("order update stream ended")
+            })
     }
 }
 
