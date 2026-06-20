@@ -57,6 +57,7 @@ pub use errors::IbError;
 pub use exchange::get_primary_exchange;
 pub use contract::{build_option_contract, parse_expiry};
 pub use streaming::{TickEvent, TickStream};
+pub use orders::{OpenOrder, OrderStatusEvent, OrderStatusStream};
 pub use historical::{Bar, BarSize, Duration, HistoricalData, WhatToShow, TradingHours};
 
 // ibapi re-exports — so Huat only needs ibcore
