@@ -104,6 +104,86 @@ impl PyOptionSnapshot {
     }
 }
 
+/// Open order snapshot returned by `IbClient.open_orders()`.
+#[pyclass(name = "OpenOrder")]
+#[derive(Clone)]
+pub struct PyOpenOrder {
+    #[pyo3(get)]
+    order_id: i32,
+    #[pyo3(get)]
+    symbol: String,
+    #[pyo3(get)]
+    action: String,
+    #[pyo3(get)]
+    quantity: f64,
+    #[pyo3(get)]
+    order_type: String,
+    #[pyo3(get)]
+    limit_price: Option<f64>,
+    #[pyo3(get)]
+    status: String,
+    #[pyo3(get)]
+    filled_qty: f64,
+    #[pyo3(get)]
+    remaining_qty: f64,
+}
+
+#[pymethods]
+impl PyOpenOrder {
+    #[new]
+    #[pyo3(signature = (order_id=0, symbol="".into(), action="".into(), quantity=0.0,
+                        order_type="".into(), limit_price=None, status="".into(),
+                        filled_qty=0.0, remaining_qty=0.0))]
+    fn new(
+        order_id: i32,
+        symbol: String,
+        action: String,
+        quantity: f64,
+        order_type: String,
+        limit_price: Option<f64>,
+        status: String,
+        filled_qty: f64,
+        remaining_qty: f64,
+    ) -> Self {
+        PyOpenOrder {
+            order_id,
+            symbol,
+            action,
+            quantity,
+            order_type,
+            limit_price,
+            status,
+            filled_qty,
+            remaining_qty,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OpenOrder(order_id={}, symbol={:?}, action={:?}, quantity={}, order_type={:?}, limit_price={:?}, status={:?}, filled_qty={}, remaining_qty={})",
+            self.order_id, self.symbol, self.action, self.quantity,
+            self.order_type, self.limit_price, self.status,
+            self.filled_qty, self.remaining_qty,
+        )
+    }
+}
+
+impl From<ibcore::OpenOrder> for PyOpenOrder {
+    fn from(o: ibcore::OpenOrder) -> Self {
+        PyOpenOrder {
+            order_id: o.order_id,
+            symbol: o.symbol,
+            action: o.action,
+            quantity: o.quantity,
+            order_type: o.order_type,
+            limit_price: o.limit_price,
+            status: o.status,
+            filled_qty: o.filled_qty,
+            remaining_qty: o.remaining_qty,
+        }
+    }
+}
+
 /// Structured diagnostic event from IB Gateway notice stream.
 #[pyclass(name = "DiagnosticEvent")]
 #[derive(Clone)]
