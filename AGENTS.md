@@ -19,7 +19,7 @@
 ```bash
 cargo test --lib
 ```
-124 tests covering: client, snapshots, diagnostics, errors, orders, streaming, historical, chain, contract, exchange.
+131 tests covering: client, snapshots, diagnostics, errors, orders, streaming, historical, chain, contract, exchange.
 
 ### Python Tests
 ```bash
