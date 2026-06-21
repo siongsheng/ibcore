@@ -84,33 +84,157 @@ impl From<&crate::DiagnosticEvent> for DiagnosticEventPayload {
     }
 }
 
-/// STUB — Run the diagnostic event batcher background task.
+/// Run the diagnostic event batcher background task.
+///
+/// Subscribes to `diagnostic_rx`, accumulates events in a ring buffer, and
+/// flushes batches via `batch_tx` at every `interval_duration` tick.
+///
+/// On error_code 10197 (competing session / FarmDisconnect), flushes
+/// immediately.
 pub(crate) async fn run_batcher(
-    _diagnostic_rx: broadcast::Receiver<crate::DiagnosticEvent>,
-    _interval_duration: Duration,
-    _batch_tx: mpsc::Sender<DiagnosticBatch>,
-    _session: SessionFingerprint,
+    mut diagnostic_rx: broadcast::Receiver<crate::DiagnosticEvent>,
+    interval_duration: Duration,
+    batch_tx: mpsc::Sender<DiagnosticBatch>,
+    session: SessionFingerprint,
 ) {
-    // STUB: never flushes — tests expecting batches will timeout
-    futures::future::pending::<()>().await;
+    let mut ring: VecDeque<DiagnosticEventPayload> = VecDeque::with_capacity(RING_BUFFER_CAPACITY);
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            result = diagnostic_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        if ring.len() >= RING_BUFFER_CAPACITY {
+                            let dropped = ring.pop_front();
+                            if let Some(dropped) = dropped {
+                                tracing::warn!(
+                                    "ring buffer overflow — dropped event code={}",
+                                    dropped.error_code
+                                );
+                            }
+                        }
+                        let payload = DiagnosticEventPayload::from(&event);
+                        let is_critical = event.error_code == 10197;
+                        ring.push_back(payload);
+                        if is_critical {
+                            flush_batch(&ring, &batch_tx, &session).await;
+                            ring.clear();
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("batcher: diagnostic broadcast closed");
+                        flush_batch(&ring, &batch_tx, &session).await;
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("batcher: lagged by {n} diagnostic events");
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                flush_batch(&ring, &batch_tx, &session).await;
+            }
+        }
+    }
 }
 
-/// STUB — Flush the current ring buffer as a batch.
+/// Flush the current ring buffer as a batch, if non-empty.
 async fn flush_batch(
-    _ring: &VecDeque<DiagnosticEventPayload>,
-    _batch_tx: &mpsc::Sender<DiagnosticBatch>,
-    _session: &SessionFingerprint,
+    ring: &VecDeque<DiagnosticEventPayload>,
+    batch_tx: &mpsc::Sender<DiagnosticBatch>,
+    session: &SessionFingerprint,
 ) {
+    if ring.is_empty() {
+        return;
+    }
+
+    let batch = DiagnosticBatch {
+        session: session.clone(),
+        events: ring.iter().cloned().collect(),
+    };
+
+    match tokio::time::timeout(FLUSH_TIMEOUT, batch_tx.send(batch)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(mpsc::error::SendError { .. })) => {
+            tracing::error!("batcher: poller dropped — stopping flush");
+        }
+        Err(_) => {
+            tracing::warn!("batcher: flush timed out after {FLUSH_TIMEOUT:?} — batch dropped");
+        }
+    }
 }
 
-/// STUB — Run the HTTP poller background task.
+/// Run the HTTP poller background task.
+///
+/// Receives batches from `batch_rx`, POSTs them to the ibquirk endpoint,
+/// and emits `RemoteDiagnosis` responses on `diagnosis_tx`.
 pub(crate) async fn run_poller(
-    mut _batch_rx: mpsc::Receiver<DiagnosticBatch>,
-    _config: RemoteDiagnosticsConfig,
-    _diagnosis_tx: broadcast::Sender<RemoteDiagnosis>,
+    mut batch_rx: mpsc::Receiver<DiagnosticBatch>,
+    config: RemoteDiagnosticsConfig,
+    diagnosis_tx: broadcast::Sender<RemoteDiagnosis>,
 ) {
-    // STUB: never processes
-    futures::future::pending::<()>().await;
+    let client = reqwest::Client::new();
+    let mut consecutive_failures: u64 = 0;
+
+    while let Some(batch) = batch_rx.recv().await {
+        let payload = match serde_json::to_string(&batch) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("poller: failed to serialize batch: {e}");
+                continue;
+            }
+        };
+
+        let response = client
+            .post(&config.endpoint)
+            .header("Content-Type", "application/json")
+            .bearer_auth(&config.api_token)
+            .body(payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    consecutive_failures = 0;
+                    if let Ok(diagnoses) = resp.json::<DiagnosticResponse>().await {
+                        for d in diagnoses.diagnoses {
+                            let _ = diagnosis_tx.send(d);
+                        }
+                    }
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    tracing::warn!("poller: 429 rate limited");
+                } else {
+                    consecutive_failures += 1;
+                    let backoff = Duration::from_secs(
+                        (consecutive_failures * config.batch_interval.as_secs())
+                            .min(MAX_BACKOFF_SECS),
+                    );
+                    tracing::warn!(
+                        "poller: POST returned {status} — backoff {backoff:?} (failure #{consecutive_failures})"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                let backoff = Duration::from_secs(
+                    (consecutive_failures * config.batch_interval.as_secs())
+                        .min(MAX_BACKOFF_SECS),
+                );
+                tracing::error!(
+                    "poller: request failed: {e} — backoff {backoff:?} (failure #{consecutive_failures})"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+
+    tracing::error!("poller: batcher task died — stopping poller");
 }
 
 /// Wrapper for the ibquirk API response body.
