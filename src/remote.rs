@@ -2,6 +2,10 @@
 //! Feature-gated behind `remote-diagnostics`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc};
+use tracing;
 
 /// Diagnosis returned by ibquirk's AI.
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +65,59 @@ pub struct DiagnosticBatch {
 pub const BATCHER_TO_POLLER_CAPACITY: usize = 16;
 pub const DIAGNOSIS_BUFFER: usize = 32;
 pub const MAX_BACKOFF_SECS: u64 = 60;
+
+/// Maximum ring buffer size for the batcher.
+const RING_BUFFER_CAPACITY: usize = 64;
+
+/// Maximum time to wait for an mpsc send before dropping the batch.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl From<&crate::DiagnosticEvent> for DiagnosticEventPayload {
+    fn from(event: &crate::DiagnosticEvent) -> Self {
+        Self {
+            error_code: event.error_code,
+            farm_status: event.farm_status,
+            message: event.error_message.clone(),
+            timestamp: event.timestamp.to_rfc3339(),
+            gateway_version: event.gateway_version,
+        }
+    }
+}
+
+/// STUB — Run the diagnostic event batcher background task.
+pub(crate) async fn run_batcher(
+    _diagnostic_rx: broadcast::Receiver<crate::DiagnosticEvent>,
+    _interval_duration: Duration,
+    _batch_tx: mpsc::Sender<DiagnosticBatch>,
+    _session: SessionFingerprint,
+) {
+    // STUB: never flushes — tests expecting batches will timeout
+    futures::future::pending::<()>().await;
+}
+
+/// STUB — Flush the current ring buffer as a batch.
+async fn flush_batch(
+    _ring: &VecDeque<DiagnosticEventPayload>,
+    _batch_tx: &mpsc::Sender<DiagnosticBatch>,
+    _session: &SessionFingerprint,
+) {
+}
+
+/// STUB — Run the HTTP poller background task.
+pub(crate) async fn run_poller(
+    mut _batch_rx: mpsc::Receiver<DiagnosticBatch>,
+    _config: RemoteDiagnosticsConfig,
+    _diagnosis_tx: broadcast::Sender<RemoteDiagnosis>,
+) {
+    // STUB: never processes
+    futures::future::pending::<()>().await;
+}
+
+/// Wrapper for the ibquirk API response body.
+#[derive(Debug, Deserialize)]
+struct DiagnosticResponse {
+    diagnoses: Vec<RemoteDiagnosis>,
+}
 
 #[cfg(test)]
 #[cfg(feature = "remote-diagnostics")]
@@ -187,5 +244,204 @@ mod tests {
         };
         let json = serde_json::to_string(&batch).unwrap();
         assert!(json.contains("\"events\":[]"));
+    }
+
+    // ── Batcher async tests ──
+
+    #[tokio::test]
+    async fn batcher_flushes_on_interval() {
+        let (diagnostic_tx, diagnostic_rx) = broadcast::channel(16);
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let session = SessionFingerprint {
+            gateway_version: 1030,
+            os: "linux",
+            account_type: crate::AccountType::Paper,
+            client_version: "0.1.1",
+        };
+
+        let handle = tokio::spawn(run_batcher(
+            diagnostic_rx,
+            Duration::from_millis(50),
+            batch_tx,
+            session,
+        ));
+
+        let event = crate::DiagnosticEvent {
+            gateway_version: 1030,
+            error_code: 2104,
+            error_message: "OK".into(),
+            error_time: None,
+            farm_status: crate::FarmState::Ok,
+            connection_state: crate::ConnectionState::Connected,
+            account_type: crate::AccountType::Paper,
+            os: "linux",
+            timestamp: chrono::Utc::now(),
+        };
+        diagnostic_tx.send(event).unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), batch_rx.recv())
+            .await
+            .expect("timeout waiting for batch")
+            .expect("batcher closed before sending batch");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].error_code, 2104);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn batcher_flushes_immediately_on_10197() {
+        let (diagnostic_tx, diagnostic_rx) = broadcast::channel(16);
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let session = SessionFingerprint {
+            gateway_version: 1030,
+            os: "linux",
+            account_type: crate::AccountType::Paper,
+            client_version: "0.1.1",
+        };
+
+        let handle = tokio::spawn(run_batcher(
+            diagnostic_rx,
+            Duration::from_secs(60),
+            batch_tx,
+            session,
+        ));
+
+        let event = crate::DiagnosticEvent {
+            gateway_version: 1030,
+            error_code: 10197,
+            error_message: "competing session".into(),
+            error_time: None,
+            farm_status: crate::FarmState::Unknown(10197),
+            connection_state: crate::ConnectionState::Connected,
+            account_type: crate::AccountType::Paper,
+            os: "linux",
+            timestamp: chrono::Utc::now(),
+        };
+        diagnostic_tx.send(event).unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), batch_rx.recv())
+            .await
+            .expect("timeout waiting for critical flush")
+            .expect("batcher closed before sending batch");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].error_code, 10197);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn batcher_skips_empty_flush() {
+        let (diagnostic_tx, diagnostic_rx) = broadcast::channel(16);
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let session = SessionFingerprint {
+            gateway_version: 1030,
+            os: "linux",
+            account_type: crate::AccountType::Paper,
+            client_version: "0.1.1",
+        };
+
+        let handle = tokio::spawn(run_batcher(
+            diagnostic_rx,
+            Duration::from_millis(20),
+            batch_tx,
+            session,
+        ));
+
+        let result = tokio::time::timeout(Duration::from_millis(100), batch_rx.recv()).await;
+        assert!(result.is_err(), "empty batch should not be sent");
+
+        let event = crate::DiagnosticEvent {
+            gateway_version: 1030,
+            error_code: 2104,
+            error_message: "OK".into(),
+            error_time: None,
+            farm_status: crate::FarmState::Ok,
+            connection_state: crate::ConnectionState::Connected,
+            account_type: crate::AccountType::Paper,
+            os: "linux",
+            timestamp: chrono::Utc::now(),
+        };
+        diagnostic_tx.send(event).unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), batch_rx.recv())
+            .await
+            .expect("timeout waiting for batch after event")
+            .expect("batcher closed");
+        assert_eq!(batch.events.len(), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn batcher_exits_on_broadcast_close() {
+        let (diagnostic_tx, diagnostic_rx) = broadcast::channel::<crate::DiagnosticEvent>(16);
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let session = SessionFingerprint {
+            gateway_version: 1030,
+            os: "linux",
+            account_type: crate::AccountType::Paper,
+            client_version: "0.1.1",
+        };
+
+        let handle = tokio::spawn(run_batcher(
+            diagnostic_rx,
+            Duration::from_secs(60),
+            batch_tx,
+            session,
+        ));
+
+        drop(diagnostic_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "batcher did not exit on broadcast close");
+    }
+
+    #[tokio::test]
+    async fn batcher_ring_buffer_overflow_drops_oldest() {
+        let (diagnostic_tx, diagnostic_rx) = broadcast::channel::<crate::DiagnosticEvent>(256);
+        let (batch_tx, mut batch_rx) = mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let session = SessionFingerprint {
+            gateway_version: 1030,
+            os: "linux",
+            account_type: crate::AccountType::Paper,
+            client_version: "0.1.1",
+        };
+
+        let handle = tokio::spawn(run_batcher(
+            diagnostic_rx,
+            Duration::from_millis(50),
+            batch_tx,
+            session,
+        ));
+
+        for i in 0..RING_BUFFER_CAPACITY + 10 {
+            let event = crate::DiagnosticEvent {
+                gateway_version: 1030,
+                error_code: 2100 + i as i32,
+                error_message: format!("event {i}"),
+                error_time: None,
+                farm_status: crate::FarmState::Ok,
+                connection_state: crate::ConnectionState::Connected,
+                account_type: crate::AccountType::Paper,
+                os: "linux",
+                timestamp: chrono::Utc::now(),
+            };
+            diagnostic_tx.send(event).unwrap();
+        }
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), batch_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("batcher closed");
+
+        assert!(batch.events.len() <= RING_BUFFER_CAPACITY);
+        let first_code = batch.events[0].error_code;
+        assert!(
+            first_code > 2100,
+            "expected newer events, got code={first_code}"
+        );
+
+        handle.abort();
     }
 }
