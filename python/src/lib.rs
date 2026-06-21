@@ -256,6 +256,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty,
                 avg_price,
                 commission,
+                execution_id: _,
             } => PyOrderStatusEvent {
                 kind: "Filled".into(),
                 order_id,
@@ -1539,6 +1540,7 @@ mod tests {
             filled_qty: 0.0,
             avg_price: 0.0,
             commission: Some(1.50),
+            execution_id: None,
         };
         let py: PyOrderStatusEvent = rust.into();
         assert_eq!(py.kind, "Filled");
@@ -1562,6 +1564,7 @@ mod tests {
             filled_qty: 100.0,
             avg_price: 450.0,
             commission: None,
+            execution_id: None,
         };
         let py: PyOrderStatusEvent = rust.into();
         assert_eq!(py.kind, "Filled");
