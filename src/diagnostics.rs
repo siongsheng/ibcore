@@ -22,6 +22,8 @@
 //! assert_eq!(event.farm_status.to_string(), "ok");
 //! ```
 
+use serde::{Deserialize, Serialize};
+
 /// A structured diagnostic event emitted when the IB Gateway notice stream
 /// produces an error, warning, or farm-status notification.
 ///
@@ -59,7 +61,7 @@ pub struct DiagnosticEvent {
 /// | 2108    | `Warning`   |
 /// | 2107    | `Inactive`  |
 /// | other   | `Unknown`   |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FarmState {
     /// Data farm is operating normally (codes 2104, 2106).
     Ok,
