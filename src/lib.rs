@@ -47,6 +47,9 @@ pub mod orders;
 pub mod streaming;
 pub mod historical;
 
+#[cfg(feature = "remote-diagnostics")]
+pub mod remote;
+
 // ── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use client::{IbClient, is_connection_dead};
