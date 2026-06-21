@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Diagnosis returned by ibquirk's AI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RemoteDiagnosis {
     pub matched_quirk: String,
     pub title: String,
@@ -33,7 +33,7 @@ impl std::fmt::Debug for RemoteDiagnosticsConfig {
 }
 
 /// Session fingerprint for batch POSTs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionFingerprint {
     pub gateway_version: i32,
     pub os: &'static str,
@@ -42,7 +42,7 @@ pub struct SessionFingerprint {
 }
 
 /// Diagnostic event payload for wire transmission.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticEventPayload {
     pub error_code: i32,
     pub farm_status: crate::FarmState,
@@ -52,7 +52,7 @@ pub struct DiagnosticEventPayload {
 }
 
 /// A batch of diagnostic events ready for POST.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticBatch {
     pub session: SessionFingerprint,
     pub events: Vec<DiagnosticEventPayload>,
@@ -79,6 +79,47 @@ mod tests {
         }"#;
         let d: RemoteDiagnosis = serde_json::from_str(json).unwrap();
         assert_eq!(d.matched_quirk, "Q002");
+        assert_eq!(d.confidence, 0.94);
+        assert!(d.confidence > 0.0 && d.confidence <= 1.0);
+    }
+
+    #[test]
+    fn remote_diagnosis_deserializes_zero_confidence() {
+        let json = r#"{
+            "matched_quirk": "Q000",
+            "title": "Unknown condition",
+            "confidence": 0.0,
+            "root_cause": "",
+            "workaround": "",
+            "verification": ""
+        }"#;
+        let d: RemoteDiagnosis = serde_json::from_str(json).unwrap();
+        assert_eq!(d.confidence, 0.0);
+        assert_eq!(d.matched_quirk, "Q000");
+    }
+
+    #[test]
+    fn remote_diagnosis_deserializes_max_confidence() {
+        let json = r#"{
+            "matched_quirk": "Q999",
+            "title": "Perfect match",
+            "confidence": 1.0,
+            "root_cause": "Matched perfectly",
+            "workaround": "None needed",
+            "verification": "Verified"
+        }"#;
+        let d: RemoteDiagnosis = serde_json::from_str(json).unwrap();
+        assert_eq!(d.confidence, 1.0);
+    }
+
+    #[test]
+    fn remote_diagnosis_rejects_missing_field() {
+        let json = r#"{
+            "matched_quirk": "Q002",
+            "confidence": 0.94
+        }"#;
+        let result: Result<RemoteDiagnosis, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "missing fields should fail deserialization");
     }
 
     #[test]
@@ -89,8 +130,8 @@ mod tests {
             batch_interval: std::time::Duration::from_secs(5),
         };
         let debug = format!("{cfg:?}");
-        assert!(debug.contains("REDACTED"));
-        assert!(!debug.contains("ibq_live_secret"));
+        assert!(debug.contains("REDACTED"), "token should be redacted: {debug}");
+        assert!(!debug.contains("ibq_live_secret"), "token leaked: {debug}");
     }
 
     #[test]
@@ -103,6 +144,10 @@ mod tests {
         };
         let json = serde_json::to_string(&fp).unwrap();
         assert!(json.contains("gateway_version"));
+        assert!(json.contains("1030"));
+        assert!(json.contains("client_version"));
+        assert!(json.contains("0.1.1"));
+        assert!(json.contains("account_type"));
     }
 
     #[test]
@@ -124,6 +169,9 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&batch).unwrap();
         assert!(json.contains("10197"));
+        assert!(json.contains("competing live session"));
+        assert!(json.contains("farm_status"));
+        assert!(json.contains("\"Unknown\": 10197"));
     }
 
     #[test]
