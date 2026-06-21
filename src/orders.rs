@@ -146,7 +146,7 @@ impl OrderStatusStream {
                         filled_qty: 0.0,
                         avg_price: 0.0,
                         commission: Some(report.commission),
-                        execution_id: None,
+                        execution_id: normalize_execution_id(report.execution_id),
                     }));
                 }
                 Some(Ok(_)) => {
@@ -190,6 +190,13 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
             status: format!("{:?}", status.status),
         },
     }
+}
+
+/// Normalize an IB execution ID string: empty strings are coerced to `None`,
+/// preserving non-empty values. This prevents `Some("")` which would force
+/// every consumer to check for empty strings.
+fn normalize_execution_id(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 impl IbClient {
