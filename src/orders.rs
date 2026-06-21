@@ -404,6 +404,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_execution_id_coerces_empty_string() {
+        assert_eq!(super::normalize_execution_id("".into()), None);
+    }
+
+    #[test]
+    fn normalize_execution_id_preserves_non_empty() {
+        assert_eq!(
+            super::normalize_execution_id("abc123".into()),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
     fn order_status_event_cancelled_has_reason() {
         let e = OrderStatusEvent::Cancelled {
             order_id: 200,
