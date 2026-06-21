@@ -22,6 +22,8 @@
 //! assert_eq!(event.farm_status.to_string(), "ok");
 //! ```
 
+use serde::{Deserialize, Serialize};
+
 /// A structured diagnostic event emitted when the IB Gateway notice stream
 /// produces an error, warning, or farm-status notification.
 ///
@@ -59,7 +61,7 @@ pub struct DiagnosticEvent {
 /// | 2108    | `Warning`   |
 /// | 2107    | `Inactive`  |
 /// | other   | `Unknown`   |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FarmState {
     /// Data farm is operating normally (codes 2104, 2106).
     Ok,
@@ -104,7 +106,7 @@ impl std::fmt::Display for ConnectionState {
 }
 
 /// IB account type — live trading or paper simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountType {
     /// Live trading account.
     Live,
@@ -145,6 +147,7 @@ pub fn classify_farm(code: i32) -> FarmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     // ── classify_farm tests ──
 
@@ -251,5 +254,60 @@ mod tests {
         assert_eq!(event.connection_state, ConnectionState::Connected);
         assert_eq!(event.account_type, AccountType::Paper);
         assert_eq!(event.os, std::env::consts::OS);
+    }
+
+    // ── FarmState Serialize/Deserialize tests ──
+
+    #[test]
+    fn farm_state_ok_serializes_to_json() {
+        let json = serde_json::to_string(&FarmState::Ok).unwrap();
+        assert_eq!(json, "\"Ok\"");
+    }
+
+    #[test]
+    fn farm_state_warning_serializes_to_json() {
+        let json = serde_json::to_string(&FarmState::Warning).unwrap();
+        assert_eq!(json, "\"Warning\"");
+    }
+
+    #[test]
+    fn farm_state_inactive_serializes_to_json() {
+        let json = serde_json::to_string(&FarmState::Inactive).unwrap();
+        assert_eq!(json, "\"Inactive\"");
+    }
+
+    #[test]
+    fn farm_state_unknown_serializes_to_json_object() {
+        let json = serde_json::to_string(&FarmState::Unknown(10197)).unwrap();
+        assert_eq!(json, "{\"Unknown\":10197}");
+    }
+
+    #[test]
+    fn farm_state_ok_deserializes_from_json() {
+        let state: FarmState = serde_json::from_str("\"Ok\"").unwrap();
+        assert_eq!(state, FarmState::Ok);
+    }
+
+    #[test]
+    fn farm_state_unknown_deserializes_from_json_object() {
+        let state: FarmState = serde_json::from_str("{\"Unknown\":10197}").unwrap();
+        assert_eq!(state, FarmState::Unknown(10197));
+    }
+
+    #[test]
+    fn farm_state_round_trips_ok() {
+        for (original, expected_json) in &[
+            (FarmState::Ok, "\"Ok\""),
+            (FarmState::Warning, "\"Warning\""),
+            (FarmState::Inactive, "\"Inactive\""),
+            (FarmState::Unknown(0), "{\"Unknown\":0}"),
+            (FarmState::Unknown(2107), "{\"Unknown\":2107}"),
+            (FarmState::Unknown(9999), "{\"Unknown\":9999}"),
+        ] {
+            let json = serde_json::to_string(original).unwrap();
+            assert_eq!(&json, expected_json, "serialize failed for {original:?}");
+            let deserialized: FarmState = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, *original, "deserialize failed for {original:?}");
+        }
     }
 }
