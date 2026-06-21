@@ -67,6 +67,11 @@ pub enum OrderStatusEvent {
         avg_price: f64,
         /// Optional commission from the next commission report.
         commission: Option<f64>,
+        /// Execution ID from the CommissionReport, for correlating fills
+        /// with their commission reports. `None` for fill-status events
+        /// (which carry no execution ID), `Some(...)` for commission-report
+        /// events.
+        execution_id: Option<String>,
     },
     /// Order was cancelled.
     Cancelled {
@@ -137,10 +142,11 @@ impl OrderStatusStream {
                     // Commission reports are handled as part of Filled events.
                     // We emit them as separate events for consumers that want them.
                     return Some(Ok(OrderStatusEvent::Filled {
-                        order_id: 0, // Not available in commission report; caller matches via order_ref
+                        order_id: 0, // Not available in commission report; caller matches via execution_id
                         filled_qty: 0.0,
                         avg_price: 0.0,
                         commission: Some(report.commission),
+                        execution_id: normalize_execution_id(report.execution_id),
                     }));
                 }
                 Some(Ok(_)) => {
@@ -171,6 +177,7 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
                 filled_qty: status.filled,
                 avg_price: status.average_fill_price.unwrap_or(0.0),
                 commission: None,
+                execution_id: None,
             }
         }
         OrderStatusKind::Cancelled => OrderStatusEvent::Cancelled {
@@ -183,6 +190,13 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
             status: format!("{:?}", status.status),
         },
     }
+}
+
+/// Normalize an IB execution ID string: empty strings are coerced to `None`,
+/// preserving non-empty values. This prevents `Some("")` which would force
+/// every consumer to check for empty strings.
+fn normalize_execution_id(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 impl IbClient {
@@ -366,8 +380,47 @@ mod tests {
             filled_qty: 50.0,
             avg_price: 450.25,
             commission: Some(1.50),
+            execution_id: None,
         };
-        assert_eq!(format!("{e:?}"), "Filled { order_id: 100, filled_qty: 50.0, avg_price: 450.25, commission: Some(1.5) }");
+        match e {
+            OrderStatusEvent::Filled { order_id, filled_qty, avg_price, commission, .. } => {
+                assert_eq!(order_id, 100);
+                assert_eq!(filled_qty, 50.0);
+                assert_eq!(avg_price, 450.25);
+                assert_eq!(commission, Some(1.50));
+            }
+            _ => panic!("expected Filled variant"),
+        }
+    }
+
+    #[test]
+    fn order_status_event_filled_has_execution_id() {
+        let e = OrderStatusEvent::Filled {
+            order_id: 100,
+            filled_qty: 50.0,
+            avg_price: 450.25,
+            commission: None,
+            execution_id: Some("abc123".into()),
+        };
+        match e {
+            OrderStatusEvent::Filled { execution_id, .. } => {
+                assert_eq!(execution_id, Some("abc123".to_string()));
+            }
+            _ => panic!("expected Filled variant"),
+        }
+    }
+
+    #[test]
+    fn normalize_execution_id_coerces_empty_string() {
+        assert_eq!(super::normalize_execution_id("".into()), None);
+    }
+
+    #[test]
+    fn normalize_execution_id_preserves_non_empty() {
+        assert_eq!(
+            super::normalize_execution_id("abc123".into()),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
@@ -451,6 +504,7 @@ mod tests {
                 filled_qty: 100.0,
                 avg_price: 450.50,
                 commission: None,
+                execution_id: None,
             }
         );
     }

@@ -458,7 +458,7 @@ ib.disconnect()
 **Notes:**
 - `open_orders()` returns `list[dict]` — one dict per open order, with keys `order_id`, `symbol`, `action`, `quantity`, `order_type`, `limit_price`, `status`, `filled_qty`, `remaining_qty`.
 - `order_updates()` returns an `OrderUpdateReceiver` (iterable). The iterator blocks on `next()` — use a thread wrapper for timeouts.
-- Commission-only events appear as `kind="Filled"`, `order_id=0`, `commission=Some(x.xx)`. Check `event.order_id == 0 and event.commission is not None` to identify them.
+- Commission-only events appear as `kind="Filled"`, `order_id=0`, `commission=Some(x.xx)`. Check `event.order_id == 0 and event.commission is not None` to identify them. The `execution_id` field (`None` for fill-status events, `Some(id)` for commission-report events) allows matching commissions to their fills by temporal pairing.
 - `KeyboardInterrupt` during `next()` is delayed until the next event arrives.
 - Only one `order_updates()` subscription is allowed per IB Gateway. A second call returns `IbError`.
 
