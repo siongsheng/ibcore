@@ -120,13 +120,12 @@ pub(crate) async fn run_batcher(
                         let is_critical = event.error_code == 10197;
                         ring.push_back(payload);
                         if is_critical {
-                            flush_batch(&ring, &batch_tx, &session).await;
-                            ring.clear();
+                            flush_batch(&mut ring, &batch_tx, &session).await;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::debug!("batcher: diagnostic broadcast closed");
-                        flush_batch(&ring, &batch_tx, &session).await;
+                        flush_batch(&mut ring, &batch_tx, &session).await;
                         return;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -135,15 +134,16 @@ pub(crate) async fn run_batcher(
                 }
             }
             _ = interval.tick() => {
-                flush_batch(&ring, &batch_tx, &session).await;
+                flush_batch(&mut ring, &batch_tx, &session).await;
             }
         }
     }
 }
 
 /// Flush the current ring buffer as a batch, if non-empty.
+/// Clears the ring after a successful send to prevent cumulative duplication.
 async fn flush_batch(
-    ring: &VecDeque<DiagnosticEventPayload>,
+    ring: &mut VecDeque<DiagnosticEventPayload>,
     batch_tx: &mpsc::Sender<DiagnosticBatch>,
     session: &SessionFingerprint,
 ) {
@@ -157,7 +157,9 @@ async fn flush_batch(
     };
 
     match tokio::time::timeout(FLUSH_TIMEOUT, batch_tx.send(batch)).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            ring.clear();
+        }
         Ok(Err(mpsc::error::SendError { .. })) => {
             tracing::error!("batcher: poller dropped — stopping flush");
         }
