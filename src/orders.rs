@@ -371,6 +371,18 @@ mod tests {
     }
 
     #[test]
+    fn order_status_event_filled_has_execution_id() {
+        let e = OrderStatusEvent::Filled {
+            order_id: 100,
+            filled_qty: 50.0,
+            avg_price: 450.25,
+            commission: None,
+            execution_id: Some("abc123".into()),
+        };
+        assert_eq!(e.execution_id, Some("abc123".to_string()));
+    }
+
+    #[test]
     fn order_status_event_cancelled_has_reason() {
         let e = OrderStatusEvent::Cancelled {
             order_id: 200,
