@@ -119,8 +119,7 @@ impl IbClient {
         Ok(details)
     }
 
-
-        /// Subscribe to the diagnostic event stream.
+    /// Subscribe to the diagnostic event stream.
     ///
     /// Returns a receiver that will see all future [`DiagnosticEvent`]s emitted
     /// by the background notice-stream watcher. Late subscribers miss earlier
@@ -1043,5 +1042,29 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(contract_cache_key(&opt1), contract_cache_key(&opt2));
+    }
+
+    #[test]
+    fn cache_key_call_vs_put_produce_different_keys() {
+        use ibapi::contracts::{Contract, OptionRight, SecurityType};
+        let call = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 400.0,
+            right: Some(OptionRight::Call),
+            ..Default::default()
+        };
+        let put = Contract {
+            symbol: "SPY".into(),
+            security_type: SecurityType::Option,
+            exchange: "SMART".into(),
+            last_trade_date_or_contract_month: "20260717".into(),
+            strike: 400.0,
+            right: Some(OptionRight::Put),
+            ..Default::default()
+        };
+        assert_ne!(contract_cache_key(&call), contract_cache_key(&put));
     }
 }
