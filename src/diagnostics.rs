@@ -106,7 +106,7 @@ impl std::fmt::Display for ConnectionState {
 }
 
 /// IB account type — live trading or paper simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountType {
     /// Live trading account.
     Live,

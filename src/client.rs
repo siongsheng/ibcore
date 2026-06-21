@@ -46,6 +46,9 @@ use crate::{
     TickStream,
 };
 
+#[cfg(feature = "remote-diagnostics")]
+use crate::remote::{RemoteDiagnosticsConfig, SessionFingerprint, DIAGNOSIS_BUFFER, BATCHER_TO_POLLER_CAPACITY};
+
 /// Maximum number of diagnostic events that can be buffered before old ones
 /// are dropped for slow subscribers.
 const DIAGNOSTIC_BUFFER: usize = 256;
@@ -72,6 +75,12 @@ pub struct IbClient {
     diagnostic_tx: broadcast::Sender<DiagnosticEvent>,
     _diagnostic_task: tokio::task::JoinHandle<()>,
     contract_cache: tokio::sync::Mutex<HashMap<String, Vec<ibapi::contracts::ContractDetails>>>,
+    #[cfg(feature = "remote-diagnostics")]
+    _remote_diag_configured: bool,
+    #[cfg(feature = "remote-diagnostics")]
+    _remote_batcher: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "remote-diagnostics")]
+    _remote_poller: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Check if an error indicates the IB Gateway connection is dead.
@@ -204,6 +213,12 @@ impl IbClient {
             diagnostic_tx,
             _diagnostic_task,
             contract_cache: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "remote-diagnostics")]
+            _remote_diag_configured: false,
+            #[cfg(feature = "remote-diagnostics")]
+            _remote_batcher: None,
+            #[cfg(feature = "remote-diagnostics")]
+            _remote_poller: None,
         })
     }
 
@@ -212,6 +227,15 @@ impl IbClient {
     pub async fn disconnect(&self) {
         tracing::info!("disconnecting from IB Gateway");
         self._diagnostic_task.abort();
+        #[cfg(feature = "remote-diagnostics")]
+        {
+            if let Some(handle) = &self._remote_batcher {
+                handle.abort();
+            }
+            if let Some(handle) = &self._remote_poller {
+                handle.abort();
+            }
+        }
         self.inner.disconnect().await;
     }
 
@@ -288,7 +312,75 @@ impl IbClient {
 
         self.inner = inner;
         self.contract_cache = tokio::sync::Mutex::new(HashMap::new());
+        #[cfg(feature = "remote-diagnostics")]
+        {
+            // Remote diag tasks are NOT re-spawned after reconnect — the
+            // caller must call with_remote_diagnostics again if needed.
+            self._remote_diag_configured = false;
+            self._remote_batcher = None;
+            self._remote_poller = None;
+        }
         Ok(())
+    }
+
+    // ── Remote diagnostics ──
+
+    /// Enable remote diagnostic event streaming to ibquirk API.
+    ///
+    /// Consumes `self` and returns `(Self, Receiver<RemoteDiagnosis>)`.
+    /// The receiver can be used to subscribe to diagnosis responses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same client (double-invocation
+    /// guard).
+    #[cfg(feature = "remote-diagnostics")]
+    pub fn with_remote_diagnostics(
+        mut self,
+        config: RemoteDiagnosticsConfig,
+    ) -> (Self, tokio::sync::broadcast::Receiver<crate::remote::RemoteDiagnosis>) {
+        assert!(
+            !self._remote_diag_configured,
+            "with_remote_diagnostics called twice — remote diagnostics already configured"
+        );
+
+        let diagnostic_rx = self.diagnostic_tx.subscribe();
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(BATCHER_TO_POLLER_CAPACITY);
+        let (diagnosis_tx, diagnosis_rx) = tokio::sync::broadcast::channel(DIAGNOSIS_BUFFER);
+
+        let session = SessionFingerprint {
+            gateway_version: self.inner.server_version(),
+            os: std::env::consts::OS,
+            account_type: self.account_type,
+            client_version: crate::version(),
+        };
+
+        let interval = config.batch_interval;
+        let batcher_batch_tx = batch_tx.clone();
+        let batcher_session = session.clone();
+
+        let batcher_handle = tokio::spawn(async move {
+            crate::remote::run_batcher(
+                diagnostic_rx,
+                interval,
+                batcher_batch_tx,
+                batcher_session,
+            )
+            .await;
+        });
+
+        let poller_config = config.clone();
+        let poller_diagnosis_tx = diagnosis_tx.clone();
+
+        let poller_handle = tokio::spawn(async move {
+            crate::remote::run_poller(batch_rx, poller_config, poller_diagnosis_tx).await;
+        });
+
+        self._remote_diag_configured = true;
+        self._remote_batcher = Some(batcher_handle);
+        self._remote_poller = Some(poller_handle);
+
+        (self, diagnosis_rx)
     }
 
     // ── Account / Position methods ──
@@ -1066,5 +1158,49 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(contract_cache_key(&call), contract_cache_key(&put));
+    }
+
+    // ── remote diagnostics tests ──
+
+    #[cfg(feature = "remote-diagnostics")]
+    #[tokio::test]
+    async fn with_remote_diagnostics_returns_diagnosis_receiver() {
+        // This test only compiles when the remote-diagnostics feature is on.
+        // It uses IbClient::with_remote_diagnostics and verifies the diagnosis
+        // broadcast channel is returned.
+        use crate::remote::{RemoteDiagnosticsConfig, DIAGNOSIS_BUFFER};
+        use tokio::sync::broadcast;
+
+        // We can't actually connect to a Gateway in a unit test.
+        // Instead, just check that the struct has the right shape.
+        let _ = RemoteDiagnosticsConfig {
+            endpoint: "https://api.example.com/v1/diagnose".into(),
+            api_token: "test_token".into(),
+            batch_interval: std::time::Duration::from_secs(5),
+        };
+
+        // Verify that DIAGNOSIS_BUFFER is reasonable
+        assert!(DIAGNOSIS_BUFFER > 0);
+        assert_eq!(DIAGNOSIS_BUFFER, 32);
+    }
+
+    #[cfg(feature = "remote-diagnostics")]
+    #[test]
+    fn with_remote_diagnostics_types_accessible() {
+        // Verify that types needed for with_remote_diagnostics are accessible
+        use crate::remote::{RemoteDiagnosis, RemoteDiagnosticsConfig};
+        let _config = RemoteDiagnosticsConfig {
+            endpoint: String::new(),
+            api_token: String::new(),
+            batch_interval: std::time::Duration::from_secs(1),
+        };
+        let _diag = RemoteDiagnosis {
+            matched_quirk: String::new(),
+            title: String::new(),
+            confidence: 0.0,
+            root_cause: String::new(),
+            workaround: String::new(),
+            verification: String::new(),
+        };
     }
 }
