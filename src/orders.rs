@@ -142,7 +142,7 @@ impl OrderStatusStream {
                     // Commission reports are handled as part of Filled events.
                     // We emit them as separate events for consumers that want them.
                     return Some(Ok(OrderStatusEvent::Filled {
-                        order_id: 0, // Not available in commission report; caller matches via order_ref
+                        order_id: 0, // Not available in commission report; caller matches via execution_id
                         filled_qty: 0.0,
                         avg_price: 0.0,
                         commission: Some(report.commission),

@@ -199,6 +199,8 @@ pub struct PyOrderStatusEvent {
     #[pyo3(get)]
     commission: Option<f64>,
     #[pyo3(get)]
+    execution_id: Option<String>,
+    #[pyo3(get)]
     reason: String,
     #[pyo3(get)]
     status: String,
@@ -208,14 +210,15 @@ pub struct PyOrderStatusEvent {
 impl PyOrderStatusEvent {
     #[new]
     #[pyo3(signature = (kind="".into(), order_id=0, filled_qty=0.0,
-                        avg_price=0.0, commission=None, reason="".into(),
-                        status="".into()))]
+                        avg_price=0.0, commission=None, execution_id=None,
+                        reason="".into(), status="".into()))]
     fn new(
         kind: String,
         order_id: i32,
         filled_qty: f64,
         avg_price: f64,
         commission: Option<f64>,
+        execution_id: Option<String>,
         reason: String,
         status: String,
     ) -> Self {
@@ -225,6 +228,7 @@ impl PyOrderStatusEvent {
             filled_qty,
             avg_price,
             commission,
+            execution_id,
             reason,
             status,
         }
@@ -232,9 +236,9 @@ impl PyOrderStatusEvent {
 
     fn __repr__(&self) -> String {
         format!(
-            "OrderStatusEvent(kind={:?}, order_id={}, filled_qty={}, avg_price={}, commission={:?}, reason={:?}, status={:?})",
+            "OrderStatusEvent(kind={:?}, order_id={}, filled_qty={}, avg_price={}, commission={:?}, execution_id={:?}, reason={:?}, status={:?})",
             self.kind, self.order_id, self.filled_qty, self.avg_price,
-            self.commission, self.reason, self.status,
+            self.commission, self.execution_id, self.reason, self.status,
         )
     }
 }
@@ -248,6 +252,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty: 0.0,
                 avg_price: 0.0,
                 commission: None,
+                execution_id: None,
                 reason: String::new(),
                 status: String::new(),
             },
@@ -256,13 +261,14 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty,
                 avg_price,
                 commission,
-                execution_id: _,
+                execution_id,
             } => PyOrderStatusEvent {
                 kind: "Filled".into(),
                 order_id,
                 filled_qty,
                 avg_price,
                 commission,
+                execution_id,
                 reason: String::new(),
                 status: String::new(),
             },
@@ -272,6 +278,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty: 0.0,
                 avg_price: 0.0,
                 commission: None,
+                execution_id: None,
                 reason,
                 status: String::new(),
             },
@@ -281,6 +288,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty: 0.0,
                 avg_price: 0.0,
                 commission: None,
+                execution_id: None,
                 reason: String::new(),
                 status: String::new(),
             },
@@ -290,6 +298,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty: 0.0,
                 avg_price: 0.0,
                 commission: None,
+                execution_id: None,
                 reason,
                 status: String::new(),
             },
@@ -299,6 +308,7 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 filled_qty: 0.0,
                 avg_price: 0.0,
                 commission: None,
+                execution_id: None,
                 reason: String::new(),
                 status,
             },
