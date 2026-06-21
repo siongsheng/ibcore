@@ -67,6 +67,11 @@ pub enum OrderStatusEvent {
         avg_price: f64,
         /// Optional commission from the next commission report.
         commission: Option<f64>,
+        /// Execution ID from the CommissionReport, for correlating fills
+        /// with their commission reports. `None` for fill-status events
+        /// (which carry no execution ID), `Some(...)` for commission-report
+        /// events.
+        execution_id: Option<String>,
     },
     /// Order was cancelled.
     Cancelled {
@@ -141,6 +146,7 @@ impl OrderStatusStream {
                         filled_qty: 0.0,
                         avg_price: 0.0,
                         commission: Some(report.commission),
+                        execution_id: None,
                     }));
                 }
                 Some(Ok(_)) => {
@@ -171,6 +177,7 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
                 filled_qty: status.filled,
                 avg_price: status.average_fill_price.unwrap_or(0.0),
                 commission: None,
+                execution_id: None,
             }
         }
         OrderStatusKind::Cancelled => OrderStatusEvent::Cancelled {
@@ -366,8 +373,17 @@ mod tests {
             filled_qty: 50.0,
             avg_price: 450.25,
             commission: Some(1.50),
+            execution_id: None,
         };
-        assert_eq!(format!("{e:?}"), "Filled { order_id: 100, filled_qty: 50.0, avg_price: 450.25, commission: Some(1.5) }");
+        match e {
+            OrderStatusEvent::Filled { order_id, filled_qty, avg_price, commission, .. } => {
+                assert_eq!(order_id, 100);
+                assert_eq!(filled_qty, 50.0);
+                assert_eq!(avg_price, 450.25);
+                assert_eq!(commission, Some(1.50));
+            }
+            _ => panic!("expected Filled variant"),
+        }
     }
 
     #[test]
@@ -379,7 +395,12 @@ mod tests {
             commission: None,
             execution_id: Some("abc123".into()),
         };
-        assert_eq!(e.execution_id, Some("abc123".to_string()));
+        match e {
+            OrderStatusEvent::Filled { execution_id, .. } => {
+                assert_eq!(execution_id, Some("abc123".to_string()));
+            }
+            _ => panic!("expected Filled variant"),
+        }
     }
 
     #[test]
@@ -463,6 +484,7 @@ mod tests {
                 filled_qty: 100.0,
                 avg_price: 450.50,
                 commission: None,
+                execution_id: None,
             }
         );
     }
