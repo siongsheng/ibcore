@@ -1,6 +1,6 @@
 [package]
 name = "ibcore-python"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "PyO3 Python bindings for ibcore — market data snapshots, diagnostics, order placement"
 license = "MIT"
