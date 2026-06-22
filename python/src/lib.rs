@@ -13,7 +13,7 @@ use ibcore::{
 };
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDict, PyList};
+use pyo3::types::{PyDict, PyList};
 
 // ── PyO3 type bindings ─────────────────────────────────────────────────────
 
@@ -422,77 +422,171 @@ impl PyAccountType {
     const PAPER: &'static str = "paper";
 }
 
-// ── IbError as Python exception ───────────────────────────────────────────
+// ── IbError as Python exception hierarchy ────────────────────────────────
 
-/// Typed IB error — maps raw error codes to semantic variants.
-#[pyclass(name = "IbError", extends = PyException)]
+/// Base Python exception for all IbError variants.
+/// Catch `IbError` to handle any ibcore error.
+#[pyclass(name = "IbError", extends = PyException, subclass)]
 pub struct PyIbError {
-    #[pyo3(get)]
-    category: String,
     #[pyo3(get)]
     code: Option<i32>,
     #[pyo3(get)]
     message: String,
 }
 
-/// Convert a Rust `IbError` to a Python `PyErr`.
-pub fn ib_err_to_py_err(e: &ibcore::IbError) -> PyErr {
-    let (category, code, message) = map_ib_error(e);
-    PyErr::new::<PyIbError, _>((category, code, message))
+// ── Subclass structs ─────────────────────────────────────────────────────
+
+#[pyclass(name = "IbConnectionFailedError", extends = PyIbError)]
+pub struct PyIbConnectionFailedError;
+
+#[pyclass(name = "IbConnectionResetError", extends = PyIbError)]
+pub struct PyIbConnectionResetError;
+
+#[pyclass(name = "IbMarketDataError", extends = PyIbError)]
+pub struct PyIbMarketDataError;
+
+#[pyclass(name = "IbFarmDisconnectError", extends = PyIbError)]
+pub struct PyIbFarmDisconnectError;
+
+#[pyclass(name = "IbOrderRejectedError", extends = PyIbError)]
+pub struct PyIbOrderRejectedError {
+    #[pyo3(get)]
+    rejection_json: Option<String>,
 }
 
-/// Convert a Rust `IbError` to arguments for constructing a Python `IbError`.
-fn map_ib_error(e: &ibcore::IbError) -> (String, Option<i32>, String) {
+#[pyclass(name = "IbContractResolutionError", extends = PyIbError)]
+pub struct PyIbContractResolutionError;
+
+#[pyclass(name = "IbCompetingSessionError", extends = PyIbError)]
+pub struct PyIbCompetingSessionError;
+
+#[pyclass(name = "IbTimeoutError", extends = PyIbError)]
+pub struct PyIbTimeoutError;
+
+/// Convert a Rust `IbError` to the appropriate Python exception `PyErr`.
+pub fn ib_err_to_py_err(e: &ibcore::IbError) -> PyErr {
     match e {
         ibcore::IbError::ConnectionFailed(msg) => {
-            ("connection_failed".into(), None, msg.clone())
+            PyErr::new::<PyIbConnectionFailedError, _>((None::<i32>, msg.clone()))
         }
         ibcore::IbError::ConnectionReset => {
-            ("connection_reset".into(), None, "connection reset".into())
+            PyErr::new::<PyIbConnectionResetError, _>((None::<i32>, "connection reset".to_string()))
         }
         ibcore::IbError::MarketData { code, message } => {
-            ("market_data".into(), Some(*code), message.clone())
+            PyErr::new::<PyIbMarketDataError, _>((Some(*code), message.clone()))
         }
         ibcore::IbError::OrderRejected {
             code,
             message,
             rejection_json,
         } => {
-            let msg = if let Some(json) = rejection_json {
-                format!("{} [{}]", message, json)
-            } else {
-                message.clone()
-            };
-            ("order_rejected".into(), Some(*code), msg)
+            // OrderRejected has an extra field; we construct via __new__ with 3 args
+            PyErr::new::<PyIbOrderRejectedError, _>((Some(*code), message.clone(), rejection_json.clone()))
         }
         ibcore::IbError::FarmDisconnect { code, message } => {
-            ("farm_disconnect".into(), Some(*code), message.clone())
+            PyErr::new::<PyIbFarmDisconnectError, _>((Some(*code), message.clone()))
         }
         ibcore::IbError::ContractResolution(msg) => {
-            ("contract_resolution".into(), None, msg.clone())
+            PyErr::new::<PyIbContractResolutionError, _>((None::<i32>, msg.clone()))
         }
         ibcore::IbError::CompetingSession => {
-            ("competing_session".into(), None, "competing session (10197)".into())
+            PyErr::new::<PyIbCompetingSessionError, _>((None::<i32>, "competing session (10197)".to_string()))
         }
-        ibcore::IbError::Timeout(msg) => ("timeout".into(), None, msg.clone()),
-        ibcore::IbError::Other(msg) => ("other".into(), None, msg.clone()),
+        ibcore::IbError::Timeout(msg) => {
+            PyErr::new::<PyIbTimeoutError, _>((None::<i32>, msg.clone()))
+        }
+        ibcore::IbError::Other(msg) => {
+            PyErr::new::<PyIbError, _>((None::<i32>, msg.clone()))
+        }
     }
 }
 
 #[pymethods]
 impl PyIbError {
     #[new]
-    #[pyo3(signature = (category, code, message))]
-    fn new(category: String, code: Option<i32>, message: String) -> Self {
-        PyIbError { category, code, message }
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> Self {
+        PyIbError { code, message }
     }
 
     fn __str__(&self) -> String {
         if let Some(c) = self.code {
-            format!("[{}] {}: {}", self.category, c, self.message)
+            format!("{}: {}", c, self.message)
         } else {
-            format!("[{}] {}", self.category, self.message)
+            self.message.clone()
         }
+    }
+}
+
+#[pymethods]
+impl PyIbConnectionFailedError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbConnectionResetError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbMarketDataError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbFarmDisconnectError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbOrderRejectedError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into(), rejection_json=None))]
+    fn new(code: Option<i32>, message: String, rejection_json: Option<String>) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self { rejection_json })
+    }
+}
+
+#[pymethods]
+impl PyIbContractResolutionError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbCompetingSessionError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
+    }
+}
+
+#[pymethods]
+impl PyIbTimeoutError {
+    #[new]
+    #[pyo3(signature = (code=None, message="".into()))]
+    fn new(code: Option<i32>, message: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyIbError::new(code, message)).add_subclass(Self)
     }
 }
 
@@ -510,8 +604,7 @@ fn parse_account_type(s: &str) -> Result<RustAccountType, PyErr> {
     match s {
         "live" => Ok(RustAccountType::Live),
         "paper" => Ok(RustAccountType::Paper),
-        other => Err(PyErr::new::<PyIbError, _>((
-            "connection_failed".to_string(),
+        other => Err(PyErr::new::<PyIbConnectionFailedError, _>((
             None::<i32>,
             format!("invalid account_type: {other}"),
         ))),
@@ -523,12 +616,11 @@ where
     F: FnOnce(&RustIbClient) -> PyResult<T>,
 {
     let guard = inner.lock().map_err(|e| {
-        PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+        PyErr::new::<PyIbError, _>((None::<i32>, format!("lock error: {e}")))
     })?;
     match guard.as_ref() {
         Some(client) => f(client),
-        None => Err(PyErr::new::<PyIbError, _>((
-            "connection_failed".to_string(),
+        None => Err(PyErr::new::<PyIbConnectionFailedError, _>((
             None::<i32>,
             "not connected".to_string(),
         ))),
@@ -547,8 +639,7 @@ impl PyIbClient {
         account_type: &str,
     ) -> PyResult<Py<Self>> {
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            PyErr::new::<PyIbError, _>((
-                "connection_failed".to_string(),
+            PyErr::new::<PyIbConnectionFailedError, _>((
                 None::<i32>,
                 format!("runtime creation failed: {e}"),
             ))
@@ -574,11 +665,10 @@ impl PyIbClient {
         market_data_type: &str,
     ) -> PyResult<()> {
         let mut guard = self.inner.lock().map_err(|e| {
-            PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+            PyErr::new::<PyIbError, _>((None::<i32>, format!("lock error: {e}")))
         })?;
         let client = guard.as_mut().ok_or_else(|| {
-            PyErr::new::<PyIbError, _>((
-                "connection_failed".to_string(),
+            PyErr::new::<PyIbConnectionFailedError, _>((
                 None::<i32>,
                 "not connected".to_string(),
             ))
@@ -596,7 +686,7 @@ impl PyIbClient {
         })?;
         // Clear the inner client
         let mut guard = self.inner.lock().map_err(|e| {
-            PyErr::new::<PyIbError, _>(("other".to_string(), None::<i32>, format!("lock error: {e}")))
+            PyErr::new::<PyIbError, _>((None::<i32>, format!("lock error: {e}")))
         })?;
         *guard = None;
         Ok(())
@@ -716,10 +806,10 @@ impl PyIbClient {
                 "BUY" => ibapi::orders::Action::Buy,
                 "SELL" => ibapi::orders::Action::Sell,
                 other => {
-                    return Err(PyErr::new::<PyIbError, _>((
-                        "order_rejected".to_string(),
+                    return Err(PyErr::new::<PyIbOrderRejectedError, _>((
                         None::<i32>,
                         format!("invalid action: {other}"),
+                        None::<String>,
                     )))
                 }
             };
@@ -940,6 +1030,14 @@ fn _ibcore(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyConnectionState>()?;
     m.add_class::<PyAccountType>()?;
     m.add_class::<PyIbError>()?;
+    m.add_class::<PyIbConnectionFailedError>()?;
+    m.add_class::<PyIbConnectionResetError>()?;
+    m.add_class::<PyIbMarketDataError>()?;
+    m.add_class::<PyIbFarmDisconnectError>()?;
+    m.add_class::<PyIbOrderRejectedError>()?;
+    m.add_class::<PyIbContractResolutionError>()?;
+    m.add_class::<PyIbCompetingSessionError>()?;
+    m.add_class::<PyIbTimeoutError>()?;
     m.add_class::<PyIbClient>()?;
     m.add_class::<PyDiagnosticEventReceiver>()?;
     m.add_class::<PyOpenOrder>()?;
@@ -1224,18 +1322,17 @@ mod tests {
     // ── IbError tests ──
 
     #[test]
-    fn ib_error_construct_and_str() -> PyResult<()> {
+    fn ib_error_base_construct_and_str() -> PyResult<()> {
         Python::with_gil(|py| {
             let cls = py.get_type::<PyIbError>();
-            let err = cls.call1((
-                "connection_failed",
-                Some(502_i32),
-                "Not connected".to_string(),
-            ))?;
+            let err = cls.call1((Some(502_i32), "Not connected".to_string()))?;
             let err_str = err.call_method0("__str__")?.extract::<String>()?;
-            assert!(err_str.contains("connection_failed"));
-            assert!(err_str.contains("502"));
-            assert!(err_str.contains("Not connected"));
+            assert_eq!(err_str, "502: Not connected");
+            assert_eq!(err.getattr("code")?.extract::<Option<i32>>()?, Some(502));
+            assert_eq!(
+                err.getattr("message")?.extract::<String>()?,
+                "Not connected"
+            );
             Ok(())
         })
     }
@@ -1244,10 +1341,81 @@ mod tests {
     fn ib_error_without_code() -> PyResult<()> {
         Python::with_gil(|py| {
             let cls = py.get_type::<PyIbError>();
-            let err = cls.call1(("other", py.None(), "Something weird".to_string()))?;
+            let err = cls.call1((py.None(), "Something weird".to_string()))?;
             let err_str = err.call_method0("__str__")?.extract::<String>()?;
-            assert!(err_str.contains("other"));
-            assert!(err_str.contains("Something weird"));
+            assert_eq!(err_str, "Something weird");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ib_error_subclass_type_check() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let base = py.get_type::<PyIbError>();
+            let conn_failed = py.get_type::<PyIbConnectionFailedError>();
+            let market_data = py.get_type::<PyIbMarketDataError>();
+            let timeout = py.get_type::<PyIbTimeoutError>();
+            let order_rejected = py.get_type::<PyIbOrderRejectedError>();
+
+            // Verify subclass relationships
+            assert!(conn_failed.is_subclass(&base).unwrap());
+            assert!(market_data.is_subclass(&base).unwrap());
+            assert!(timeout.is_subclass(&base).unwrap());
+            assert!(order_rejected.is_subclass(&base).unwrap());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ib_error_subclass_construct_and_str() -> PyResult<()> {
+        Python::with_gil(|py| {
+            // ConnectionFailed
+            let cls = py.get_type::<PyIbConnectionFailedError>();
+            let err = cls.call1((py.None(), "timeout".to_string()))?;
+            let err_str = err.call_method0("__str__")?.extract::<String>()?;
+            assert_eq!(err_str, "timeout");
+            assert!(err.is_instance(&py.get_type::<PyIbError>()).unwrap());
+            assert!(err.is_instance(&py.get_type::<PyIbConnectionFailedError>()).unwrap());
+
+            // MarketData
+            let cls = py.get_type::<PyIbMarketDataError>();
+            let err = cls.call1((Some(10197_i32), "competing".to_string()))?;
+            let err_str = err.call_method0("__str__")?.extract::<String>()?;
+            assert_eq!(err_str, "10197: competing");
+
+            // Timeout
+            let cls = py.get_type::<PyIbTimeoutError>();
+            let err = cls.call1((py.None(), "timed out".to_string()))?;
+            let err_str = err.call_method0("__str__")?.extract::<String>()?;
+            assert_eq!(err_str, "timed out");
+
+            // CompetingSession
+            let cls = py.get_type::<PyIbCompetingSessionError>();
+            let err = cls.call1((py.None(), "competing session (10197)".to_string()))?;
+            assert!(err.is_instance(&py.get_type::<PyIbError>()).unwrap());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ib_error_order_rejected_rejection_json() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyIbOrderRejectedError>();
+            let err = cls.call1((
+                Some(201_i32),
+                "insufficient funds".to_string(),
+                Some(r#"{"reason":"no cash"}"#.to_string()),
+            ))?;
+            assert_eq!(err.getattr("code")?.extract::<Option<i32>>()?, Some(201));
+            assert_eq!(
+                err.getattr("message")?.extract::<String>()?,
+                "insufficient funds"
+            );
+            assert_eq!(
+                err.getattr("rejection_json")?.extract::<Option<String>>()?,
+                Some(r#"{"reason":"no cash"}"#.to_string())
+            );
             Ok(())
         })
     }
@@ -1255,10 +1423,10 @@ mod tests {
     #[test]
     fn ib_error_from_rust_connection_failed() {
         let rust = ibcore::IbError::ConnectionFailed("timeout".into());
-        let (category, code, message) = map_ib_error(&rust);
-        assert_eq!(category, "connection_failed");
-        assert!(code.is_none());
-        assert_eq!(message, "timeout");
+        Python::with_gil(|py| {
+            let py_err = ib_err_to_py_err(&rust);
+            assert!(py_err.is_instance_of::<PyIbConnectionFailedError>(py));
+        })
     }
 
     #[test]
@@ -1267,24 +1435,85 @@ mod tests {
             code: 10197,
             message: "competing".into(),
         };
-        let (category, code, message) = map_ib_error(&rust);
-        assert_eq!(category, "market_data");
-        assert_eq!(code, Some(10197));
-        assert_eq!(message, "competing");
+        Python::with_gil(|py| {
+            let py_err = ib_err_to_py_err(&rust);
+            assert!(py_err.is_instance_of::<PyIbMarketDataError>(py));
+        })
     }
 
     #[test]
-    fn ib_error_from_rust_order_rejected_with_json() {
+    fn ib_error_from_rust_order_rejected() {
         let rust = ibcore::IbError::OrderRejected {
             code: 201,
             message: "insufficient funds".into(),
             rejection_json: None,
         };
-        let (category, code, message) = map_ib_error(&rust);
-        assert_eq!(category, "order_rejected");
-        assert_eq!(code, Some(201));
-        assert!(message.contains("insufficient funds"));
-        assert!(message.contains("insufficient funds"));
+        Python::with_gil(|py| {
+            let py_err = ib_err_to_py_err(&rust);
+            assert!(py_err.is_instance_of::<PyIbOrderRejectedError>(py));
+        })
+    }
+
+    #[test]
+    fn ib_error_from_rust_other_maps_to_base() {
+        let rust = ibcore::IbError::Other("unexpected".into());
+        Python::with_gil(|py| {
+            let py_err = ib_err_to_py_err(&rust);
+            assert!(py_err.is_instance_of::<PyIbError>(py));
+            assert!(!py_err.is_instance_of::<PyIbConnectionFailedError>(py));
+        })
+    }
+
+    #[test]
+    fn ib_error_base_has_subclass_flag() -> PyResult<()> {
+        Python::with_gil(|py| {
+            let cls = py.get_type::<PyIbError>();
+            // Verify it has __subclasshook__ or similar subclass support
+            let bases = cls.getattr("__bases__")?;
+            assert!(bases.extract::<Vec<PyObject>>().is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn map_all_rust_errors_to_class() {
+        let cases: Vec<(ibcore::IbError, &str)> = vec![
+            (ibcore::IbError::ConnectionFailed("fail".into()), "IbConnectionFailedError"),
+            (ibcore::IbError::ConnectionReset, "IbConnectionResetError"),
+            (
+                ibcore::IbError::MarketData {
+                    code: 10197,
+                    message: "md".into(),
+                },
+                "IbMarketDataError",
+            ),
+            (
+                ibcore::IbError::OrderRejected {
+                    code: 201,
+                    message: "rej".into(),
+                    rejection_json: None,
+                },
+                "IbOrderRejectedError",
+            ),
+            (
+                ibcore::IbError::FarmDisconnect {
+                    code: 2107,
+                    message: "fm".into(),
+                },
+                "IbFarmDisconnectError",
+            ),
+            (ibcore::IbError::ContractResolution("res".into()), "IbContractResolutionError"),
+            (ibcore::IbError::CompetingSession, "IbCompetingSessionError"),
+            (ibcore::IbError::Timeout("time".into()), "IbTimeoutError"),
+            (ibcore::IbError::Other("etc".into()), "IbError"),
+        ];
+        Python::with_gil(|py| {
+            for (err, expected_name) in cases {
+                let py_err = ib_err_to_py_err(&err);
+                let actual = py_err.get_type(py);
+                assert_eq!(actual.name().unwrap().to_str().unwrap(), expected_name, "mismatch for {err}");
+            }
+        })
     }
 
     // ── IbClient tests ──
@@ -1380,48 +1609,18 @@ mod tests {
             assert!(m.getattr("ConnectionState").is_ok());
             assert!(m.getattr("AccountType").is_ok());
             assert!(m.getattr("IbError").is_ok());
+            assert!(m.getattr("IbConnectionFailedError").is_ok());
+            assert!(m.getattr("IbConnectionResetError").is_ok());
+            assert!(m.getattr("IbMarketDataError").is_ok());
+            assert!(m.getattr("IbFarmDisconnectError").is_ok());
+            assert!(m.getattr("IbOrderRejectedError").is_ok());
+            assert!(m.getattr("IbContractResolutionError").is_ok());
+            assert!(m.getattr("IbCompetingSessionError").is_ok());
+            assert!(m.getattr("IbTimeoutError").is_ok());
             assert!(m.getattr("IbClient").is_ok());
             assert!(m.getattr("DiagnosticEventReceiver").is_ok());
             Ok(())
         })
-    }
-
-    #[test]
-    fn from_rust_errors_map_correctly() {
-        let test_cases: Vec<(ibcore::IbError, &str)> = vec![
-            (ibcore::IbError::ConnectionFailed("fail".into()), "connection_failed"),
-            (ibcore::IbError::ConnectionReset, "connection_reset"),
-            (
-                ibcore::IbError::MarketData {
-                    code: 10197,
-                    message: "md".into(),
-                },
-                "market_data",
-            ),
-            (
-                ibcore::IbError::OrderRejected {
-                    code: 201,
-                    message: "rej".into(),
-                    rejection_json: None,
-                },
-                "order_rejected",
-            ),
-            (
-                ibcore::IbError::FarmDisconnect {
-                    code: 2107,
-                    message: "fm".into(),
-                },
-                "farm_disconnect",
-            ),
-            (ibcore::IbError::ContractResolution("res".into()), "contract_resolution"),
-            (ibcore::IbError::CompetingSession, "competing_session"),
-            (ibcore::IbError::Timeout("time".into()), "timeout"),
-            (ibcore::IbError::Other("etc".into()), "other"),
-        ];
-        for (err, expected_cat) in test_cases {
-            let (cat, _, _) = map_ib_error(&err);
-            assert_eq!(cat, expected_cat, "mismatch for {err}");
-        }
     }
 
     // ── PyOpenOrder tests ──

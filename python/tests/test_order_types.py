@@ -1,6 +1,6 @@
 """Tests for OpenOrder and OrderStatusEvent types."""
 
-from _ibcore import OpenOrder, OrderStatusEvent
+from ibcore._ibcore import OpenOrder, OrderStatusEvent
 
 
 class TestOpenOrder:

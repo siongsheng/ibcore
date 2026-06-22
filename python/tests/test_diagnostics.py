@@ -1,6 +1,6 @@
 """Tests for DiagnosticEvent and enum-like classes (FarmState, ConnectionState, AccountType)."""
 
-from _ibcore import DiagnosticEvent, FarmState, ConnectionState, AccountType
+from ibcore._ibcore import DiagnosticEvent, FarmState, ConnectionState, AccountType
 
 
 class TestDiagnosticEvent:

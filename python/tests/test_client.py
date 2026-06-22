@@ -1,7 +1,10 @@
 """Tests for IbClient class existence, method presence, and error handling."""
 
 import pytest
-from _ibcore import IbClient, IbError
+from ibcore._ibcore import (
+    IbClient, IbError,
+    IbConnectionFailedError,
+)
 
 
 class TestIbClientClass:
@@ -37,11 +40,32 @@ class TestIbClientConnectErrors:
     """IbClient connect error handling (no running Gateway needed)."""
 
     def test_connect_requires_gateway(self):
-        """Connecting to a dead port raises IbError."""
-        with pytest.raises(IbError):
+        """Connecting to a dead port raises IbConnectionFailedError."""
+        with pytest.raises(IbConnectionFailedError):
             IbClient.connect("127.0.0.1", 9999, 1, "delayed", "paper")
 
+    def test_connect_requires_gateway_is_ib_error(self):
+        """IbConnectionFailedError is a subclass of IbError (backward compat)."""
+        try:
+            IbClient.connect("127.0.0.1", 9999, 1, "delayed", "paper")
+        except IbError as e:
+            assert isinstance(e, IbConnectionFailedError)
+            # Verify e.code and e.message are accessible
+            assert hasattr(e, "code")
+            assert hasattr(e, "message")
+
+    def test_connect_dead_port_code_and_message(self):
+        """Connecting to a dead port returns an error with code and message."""
+        try:
+            IbClient.connect("127.0.0.1", 9999, 1, "delayed", "paper")
+        except IbError as e:
+            assert isinstance(e, IbConnectionFailedError)
+            # e.code may be None (connection refused may not have IB error code)
+            # e.message should describe the connection failure
+            assert e.message is not None
+            assert len(e.message) > 0
+
     def test_connect_rejects_bad_account_type(self):
-        """Invalid account_type raises IbError."""
-        with pytest.raises(IbError):
+        """Invalid account_type raises IbConnectionFailedError."""
+        with pytest.raises(IbConnectionFailedError):
             IbClient.connect("127.0.0.1", 9999, 1, "delayed", "invalid")

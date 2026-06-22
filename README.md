@@ -262,7 +262,7 @@ pub struct DiagnosticEvent {
 ```
 
 Subscribe with `ib.diagnostic_events()` and process asynchronously.
-Buffer size is 256 events; slow subscribers will miss old events.
+Buffer size is 1024 events; slow subscribers will miss old events.
 
 ### `IbError`
 
@@ -279,6 +279,37 @@ Typed error variants — no raw error codes in your business logic:
 | `OrderRejected` | Order invalid | 200–299 |
 | `ContractResolution` | Contract not found | — |
 | `Other` | Unclassified | everything else |
+
+### Python
+
+The `IbError` exception is available in Python as a hierarchy of subclasses. Each Rust variant maps to a specific Python exception type, all inheriting from `IbError`:
+
+| Python Exception | Rust Variant | Extra Fields |
+|---|---|---|
+| `IbConnectionFailedError` | `ConnectionFailed` | — |
+| `IbConnectionResetError` | `ConnectionReset` | — |
+| `IbMarketDataError` | `MarketData` | — |
+| `IbFarmDisconnectError` | `FarmDisconnect` | — |
+| `IbOrderRejectedError` | `OrderRejected` | `rejection_json: Optional[str]` |
+| `IbContractResolutionError` | `ContractResolution` | — |
+| `IbCompetingSessionError` | `CompetingSession` | — |
+| `IbTimeoutError` | `Timeout` | — |
+| `IbError` (base) | `Other` | — |
+
+All subclasses expose `.code` (Optional[int]) and `.message` (str) inherited from the base `IbError` class.
+
+**Backward compat:** `except IbError:` still catches every ibcore exception. You can add more specific handlers for fine-grained control:
+
+```python
+try:
+    ib.stock_snapshot("SPY")
+except IbMarketDataError as e:
+    print(f"Market data error {e.code}: {e.message}")
+except IbConnectionFailedError:
+    reconnect()
+except IbError as e:
+    print(f"Unknown: {e}")
+```
 
 ### Helper functions
 

@@ -51,7 +51,7 @@ use crate::remote::{RemoteDiagnosticsConfig, SessionFingerprint, DIAGNOSIS_BUFFE
 
 /// Maximum number of diagnostic events that can be buffered before old ones
 /// are dropped for slow subscribers.
-const DIAGNOSTIC_BUFFER: usize = 256;
+const DIAGNOSTIC_BUFFER: usize = 1024;
 
 use std::collections::HashMap;
 

@@ -1,7 +1,7 @@
 """Tests for StockSnapshot and OptionSnapshot PyO3 types."""
 
 import pytest
-from _ibcore import StockSnapshot, OptionSnapshot
+from ibcore._ibcore import StockSnapshot, OptionSnapshot
 
 
 class TestStockSnapshot:
