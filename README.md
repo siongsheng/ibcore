@@ -262,7 +262,7 @@ pub struct DiagnosticEvent {
 ```
 
 Subscribe with `ib.diagnostic_events()` and process asynchronously.
-Buffer size is 256 events; slow subscribers will miss old events.
+Buffer size is 1024 events; slow subscribers will miss old events.
 
 ### `IbError`
 
