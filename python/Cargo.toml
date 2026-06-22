@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ibcore = { path = ".." }
-pyo3 = { version = "0.23", features = ["experimental-async", "chrono", "auto-initialize", "extension-module"] }
+pyo3 = { version = "0.23", features = ["chrono", "auto-initialize", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 ibapi = "3.0"
 chrono = "0.4"
