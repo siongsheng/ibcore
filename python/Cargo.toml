@@ -1,6 +1,6 @@
 [package]
 name = "ibcore-python"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "PyO3 Python bindings for ibcore — market data snapshots, diagnostics, order placement"
 license = "MIT"
@@ -10,7 +10,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ibcore = { path = ".." }
-pyo3 = { version = "0.23", features = ["experimental-async", "chrono", "auto-initialize", "extension-module"] }
+# `experimental-async` feature was removed — ibcore uses Tokio runtime internally
+# and bridges async ops via `rt.block_on()`. If true Python `await` support is
+# needed later, see: ../specs/pyo3-experimental-async-fallback.md
+pyo3 = { version = "0.23", features = ["chrono", "auto-initialize", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 ibapi = "3.0"
 chrono = "0.4"

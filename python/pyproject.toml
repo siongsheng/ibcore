@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ibcore-py"
-version = "0.1.1"
+version = "0.2.0"
 description = "Standalone IB Gateway integration — market data snapshots, diagnostics, order placement"
 requires-python = ">=3.9"
 readme = "../README.md"
