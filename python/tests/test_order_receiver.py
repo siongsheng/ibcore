@@ -1,6 +1,6 @@
 """Tests for OrderUpdateReceiver."""
 
-from _ibcore import OrderUpdateReceiver
+from ibcore._ibcore import OrderUpdateReceiver
 
 
 class TestOrderUpdateReceiver:
