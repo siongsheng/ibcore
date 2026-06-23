@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ibcore-py"
-version = "0.2.0"
+version = "0.2.1"
 description = "Standalone IB Gateway integration — market data snapshots, diagnostics, order placement"
 requires-python = ">=3.9"
 readme = "../README.md"
@@ -20,5 +20,11 @@ classifiers = [
     "Programming Language :: Rust",
     "Operating System :: OS Independent",
 ]
+
+[project.urls]
+Homepage = "https://ibquirk.vercel.app"
+Discord = "https://discord.gg/Z2FrsCx4H"
+Repository = "https://github.com/siongsheng/ibcore"
+
 [tool.maturin]
 module-name = "ibcore._ibcore"
