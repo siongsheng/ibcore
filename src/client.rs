@@ -15,6 +15,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use ibapi::{
@@ -26,8 +27,9 @@ use ibapi::{
     market_data::MarketDataType,
     market_data::realtime::TickTypes,
     market_data::historical::{
-        BarSize, Duration, HistoricalData, WhatToShow,
+        BarSize, HistoricalData, WhatToShow,
     },
+    market_data::historical::Duration as IbDuration,
     market_data::TradingHours,
     subscriptions::SubscriptionItemStreamExt,
 };
@@ -454,6 +456,10 @@ impl IbClient {
     }
 
     /// Single stock snapshot attempt — no retry.
+    /// 
+    /// Uses streaming market data with a 5-second timeout instead of the
+    /// ibapi snapshot API, which returns 10197 on Gateway 10.45+.
+    /// See https://github.com/wboayue/rust-ibapi/issues/683
     async fn stock_snapshot_inner(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
         let contract = if symbol == "VIX" {
             Contract {
@@ -471,29 +477,17 @@ impl IbClient {
         let sub = self
             .inner
             .market_data(&contract)
-            .snapshot()
             .subscribe()
             .await
             .map_err(|e| IbError::MarketData {
                 code: 0,
-                message: format!("stock snapshot subscribe failed: {e}"),
+                message: format!("stock market data subscribe failed: {e}"),
             })?;
-        let mut data = sub.filter_data();
-        let mut snap = StockSnapshot::default();
-        while let Some(item) = data.next().await {
-            match item {
-                Ok(TickTypes::Price(price)) => match price.tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
-                    TickType::Close | TickType::DelayedClose => snap.close = price.price,
-                    _ => {}
-                },
-                Ok(TickTypes::SnapshotEnd) => break,
-                Err(e) => tracing::warn!("stock snapshot error: {e}"),
-                _ => {}
-            }
-        }
+        let data = sub.filter_data();
+
+        let snap = collect_stock_snapshot_ticks(data).await;
+
+        // sub dropped here → streaming subscription cancelled
         Ok(snap)
     }
 
@@ -599,6 +593,10 @@ impl IbClient {
     }
 
     /// Single snapshot attempt — no retry.
+    /// 
+    /// Uses streaming market data with a 5-second timeout instead of the
+    /// ibapi snapshot API, which returns 10197 on Gateway 10.45+.
+    /// See https://github.com/wboayue/rust-ibapi/issues/683
     async fn snapshot_inner(
         &self,
         contract: &ibapi::contracts::Contract,
@@ -606,42 +604,17 @@ impl IbClient {
         let sub = self
             .inner
             .market_data(contract)
-            .snapshot()
             .subscribe()
             .await
             .map_err(|e| IbError::MarketData {
                 code: 0,
-                message: format!("option snapshot subscribe failed: {e}"),
+                message: format!("option market data subscribe failed: {e}"),
             })?;
-        let mut data = sub.filter_data();
-        let mut snap = OptionSnapshot::default();
-        while let Some(item) = data.next().await {
-            match item {
-                Ok(TickTypes::PriceSize(ps)) => match ps.price_tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = ps.price,
-                    _ => {}
-                },
-                Ok(TickTypes::Price(price)) => match price.tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
-                    _ => {}
-                },
-                Ok(TickTypes::OptionComputation(opt)) => {
-                    snap.option_iv = opt.implied_volatility.unwrap_or(0.0);
-                    snap.option_delta = opt.delta.unwrap_or(0.0);
-                    snap.option_gamma = opt.gamma.unwrap_or(0.0);
-                    snap.option_theta = opt.theta.unwrap_or(0.0);
-                    snap.option_price = opt.option_price.unwrap_or(0.0);
-                    snap.underlying_price = opt.underlying_price.unwrap_or(0.0);
-                }
-                Ok(TickTypes::SnapshotEnd) => break,
-                Err(e) => tracing::warn!("option snapshot error: {e}"),
-                _ => {}
-            }
-        }
+        let data = sub.filter_data();
+
+        let snap = collect_option_snapshot_ticks(data).await;
+
+        // sub dropped here → streaming subscription cancelled
         Ok(snap)
     }
 
@@ -840,7 +813,7 @@ impl IbClient {
         &self,
         contract: &ibapi::contracts::Contract,
         bar_size: BarSize,
-        duration: Duration,
+        duration: IbDuration,
         what_to_show: WhatToShow,
         trading_hours: TradingHours,
     ) -> Result<HistoricalData, IbError> {
@@ -936,6 +909,85 @@ where
     Fut: std::future::Future<Output = Result<OptionSnapshot, IbError>>,
 {
     retry_market_data(fetch).await
+}
+
+// ── Streaming snapshot collection (workaround for ibapi snapshot 10197) ──
+
+async fn collect_stock_snapshot_ticks(
+    mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
+) -> StockSnapshot {
+    let collect_fut = async {
+        let mut snap = StockSnapshot::default();
+        while let Some(item) = data.next().await {
+            match item {
+                Ok(TickTypes::Price(price)) => match price.tick_type {
+                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
+                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
+                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
+                    TickType::Close | TickType::DelayedClose => snap.close = price.price,
+                    _ => {}
+                },
+                Ok(TickTypes::PriceSize(ps)) => match ps.price_tick_type {
+                    TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
+                    TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
+                    TickType::Last | TickType::DelayedLast => snap.last = ps.price,
+                    _ => {}
+                },
+                Err(e) => tracing::warn!("stock snapshot error: {e}"),
+                _ => {}
+            }
+            if snap.bid > 0.0 && snap.ask > 0.0 && snap.last > 0.0 {
+                break;
+            }
+        }
+        snap
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), collect_fut)
+        .await
+        .unwrap_or_default()
+}
+
+async fn collect_option_snapshot_ticks(
+    mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
+) -> OptionSnapshot {
+    let collect_fut = async {
+        let mut snap = OptionSnapshot::default();
+        while let Some(item) = data.next().await {
+            match item {
+                Ok(TickTypes::PriceSize(ps)) => match ps.price_tick_type {
+                    TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
+                    TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
+                    TickType::Last | TickType::DelayedLast => snap.last = ps.price,
+                    _ => {}
+                },
+                Ok(TickTypes::Price(price)) => match price.tick_type {
+                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
+                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
+                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
+                    _ => {}
+                },
+                Ok(TickTypes::OptionComputation(opt)) => {
+                    snap.option_iv = opt.implied_volatility.unwrap_or(0.0);
+                    snap.option_delta = opt.delta.unwrap_or(0.0);
+                    snap.option_gamma = opt.gamma.unwrap_or(0.0);
+                    snap.option_theta = opt.theta.unwrap_or(0.0);
+                    snap.option_price = opt.option_price.unwrap_or(0.0);
+                    snap.underlying_price = opt.underlying_price.unwrap_or(0.0);
+                }
+                Err(e) => tracing::warn!("option snapshot error: {e}"),
+                _ => {}
+            }
+            if snap.bid > 0.0 && snap.ask > 0.0 {
+                break;
+            }
+        }
+        snap
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), collect_fut)
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1158,6 +1210,180 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(contract_cache_key(&call), contract_cache_key(&put));
+    }
+
+    // ── snapshot collection tests (streaming workaround for ibapi snapshot 10197) ──
+
+    /// Empty stream → timeout → returns default (all-zero) snapshot.
+    #[tokio::test]
+    async fn collect_stock_snapshot_timeout_returns_default() {
+        // A stream that never yields (simulates no data on the wire)
+        let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
+        let snap = collect_stock_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 0.0);
+        assert_eq!(snap.ask, 0.0);
+        assert_eq!(snap.last, 0.0);
+    }
+
+    /// Stream with valid ticks → collects bid/ask/last and breaks early.
+    #[tokio::test]
+    async fn collect_stock_snapshot_collects_bid_ask_last() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 101.0,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.5,
+                tick_type: TickType::Last,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_stock_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 100.0);
+        assert_eq!(snap.ask, 101.0);
+        assert_eq!(snap.last, 100.5);
+    }
+
+    /// Close price is collected from delayed Close tick.
+    #[tokio::test]
+    async fn collect_stock_snapshot_collects_close() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 101.0,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 99.0,
+                tick_type: TickType::DelayedClose,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.5,
+                tick_type: TickType::Last,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_stock_snapshot_ticks(stream).await;
+        assert_eq!(snap.close, 99.0);
+    }
+
+    /// Irrelevant ticks (size, string, generic) are ignored.
+    #[tokio::test]
+    async fn collect_stock_snapshot_ignores_non_price_ticks() {
+        use ibapi::market_data::realtime::{TickPrice, TickSize};
+        let ticks = vec![
+            Ok(TickTypes::Size(TickSize {
+                size: 500.0,
+                tick_type: TickType::BidSize,
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 101.0,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.5,
+                tick_type: TickType::Last,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_stock_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 100.0);
+    }
+
+    /// Stream error doesn't crash — it's logged and skipped.
+    #[tokio::test]
+    async fn collect_stock_snapshot_skips_stream_errors() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Err(ibapi::Error::ConnectionReset),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 101.0,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 100.5,
+                tick_type: TickType::Last,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_stock_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 100.0);
+        assert_eq!(snap.ask, 101.0);
+    }
+
+    /// Option snapshot collects bid/ask + Greeks.
+    #[tokio::test]
+    async fn collect_option_snapshot_collects_bid_ask_greeks() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                gamma: Some(0.02),
+                theta: Some(-0.05),
+                option_price: Some(5.25),
+                underlying_price: Some(100.0),
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.5,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_option_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 5.0);
+        assert_eq!(snap.ask, 5.5);
+        assert!((snap.option_iv - 0.25).abs() < 0.001);
+        assert!((snap.option_delta - 0.30).abs() < 0.001);
+        assert_eq!(snap.underlying_price, 100.0);
+    }
+
+    /// Option snapshot timeout returns default.
+    #[tokio::test]
+    async fn collect_option_snapshot_timeout_returns_default() {
+        let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
+        let snap = collect_option_snapshot_ticks(stream).await;
+        assert_eq!(snap.bid, 0.0);
+        assert_eq!(snap.ask, 0.0);
+        assert_eq!(snap.option_delta, 0.0);
     }
 
     // ── remote diagnostics tests ──

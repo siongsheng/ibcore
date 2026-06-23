@@ -13,7 +13,7 @@ documentation = "https://docs.rs/ibcore"
 members = ["python", "cli"]
 
 [dependencies]
-ibapi = "3.0"
+ibapi = "3.1.0"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
