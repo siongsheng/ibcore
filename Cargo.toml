@@ -1,11 +1,12 @@
 [package]
 name = "ibcore"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
+readme = "README.md"
 license = "MIT"
 repository = "https://github.com/siongsheng/ibcore"
-homepage = "https://github.com/siongsheng/ibcore"
+homepage = "https://ibquirk.vercel.app"
 documentation = "https://docs.rs/ibcore"
 
 [workspace]
