@@ -20,5 +20,10 @@ classifiers = [
     "Programming Language :: Rust",
     "Operating System :: OS Independent",
 ]
+[project.urls]
+Homepage = "https://ibquirk.vercel.app"
+Discord = "https://discord.gg/Z2FrsCx4H"
+Repository = "https://github.com/siongsheng/ibcore"
+
 [tool.maturin]
 module-name = "ibcore._ibcore"

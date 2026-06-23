@@ -496,6 +496,7 @@ ib.disconnect()
 ### Related
 
 - [ibquirk](https://ibquirk.vercel.app) — AI bot that diagnoses IBKR API problems using ibcore's DiagnosticEvents. Join the waitlist.
+- [Discord](https://discord.gg/Z2FrsCx4H) — Community for IBKR API developers. Get help, report bugs, share quirks.
 
 ## License
 
