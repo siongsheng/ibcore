@@ -513,9 +513,9 @@ dependencies = [
 
 [[package]]
 name = "ibapi"
-version = "3.0.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab7f26e4336d0cb94be12bc6c0779cced423c3aceda01f5fd23cbcb0446a43e"
+checksum = "6b4ca79734cea00446ac59bd2f0cfeb590f96d8647e75736fb27451af68580f2"
 dependencies = [
  "async-trait",
  "byteorder",
