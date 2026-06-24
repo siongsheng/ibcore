@@ -5,7 +5,8 @@
 
 use std::fmt;
 
-/// Structured IB error type with semantically meaningful variants.
+/// Structured IB error type with semantically meaningful variants — the
+/// primary error type for ibcore.
 ///
 /// Every IB notice, I/O error, and protocol error passes through this type
 /// before reaching consumers. Raw error codes are classified into variants:
