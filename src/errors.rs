@@ -360,6 +360,20 @@ mod tests {
         assert!(matches!(ibe, IbError::Other(_)));
     }
 
+    // ── Doc comment tests ──
+
+    #[test]
+    fn ib_error_enum_doc_mentions_primary_error_type() {
+        let src = include_str!("errors.rs");
+        let has_doc = src
+            .lines()
+            .any(|line| line.starts_with("///") && line.contains("error type for ibcore"));
+        assert!(
+            has_doc,
+            "doc comment missing 'primary error type for ibcore'"
+        );
+    }
+
     // ── From<io::Error> tests ──
 
     #[test]
