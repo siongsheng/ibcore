@@ -477,6 +477,7 @@ impl IbClient {
         let sub = self
             .inner
             .market_data(&contract)
+            .snapshot()
             .subscribe()
             .await
             .map_err(|e| IbError::MarketData {
@@ -936,14 +937,14 @@ async fn collect_stock_snapshot_ticks(
                 Err(e) => tracing::warn!("stock snapshot error: {e}"),
                 _ => {}
             }
-            if snap.bid > 0.0 && snap.ask > 0.0 && snap.last > 0.0 {
+            if snap.last > 0.0 || (snap.bid > 0.0 && snap.ask > 0.0) {
                 break;
             }
         }
         snap
     };
 
-    tokio::time::timeout(Duration::from_secs(5), collect_fut)
+    tokio::time::timeout(Duration::from_secs(10), collect_fut)
         .await
         .unwrap_or_default()
 }
@@ -964,7 +965,8 @@ async fn collect_option_snapshot_ticks(
                 Ok(TickTypes::Price(price)) => match price.tick_type {
                     TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
                     TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
+                    TickType::Last | TickType::DelayedLast
+                    | TickType::Close | TickType::DelayedClose => snap.last = price.price,
                     _ => {}
                 },
                 Ok(TickTypes::OptionComputation(opt)) => {
@@ -978,7 +980,7 @@ async fn collect_option_snapshot_ticks(
                 Err(e) => tracing::warn!("option snapshot error: {e}"),
                 _ => {}
             }
-            if snap.bid > 0.0 && snap.ask > 0.0 {
+            if snap.option_iv > 0.0 || snap.option_delta != 0.0 {
                 break;
             }
         }
@@ -1226,6 +1228,7 @@ mod tests {
     }
 
     /// Stream with valid ticks → collects bid/ask/last and breaks early.
+    /// With relaxed break, stops on bid+ask (before Last tick arrives).
     #[tokio::test]
     async fn collect_stock_snapshot_collects_bid_ask_last() {
         use ibapi::market_data::realtime::TickPrice;
@@ -1240,34 +1243,19 @@ mod tests {
                 tick_type: TickType::Ask,
                 ..Default::default()
             })),
-            Ok(TickTypes::Price(TickPrice {
-                price: 100.5,
-                tick_type: TickType::Last,
-                ..Default::default()
-            })),
         ];
         let stream = futures::stream::iter(ticks);
         let snap = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
         assert_eq!(snap.ask, 101.0);
-        assert_eq!(snap.last, 100.5);
     }
 
     /// Close price is collected from delayed Close tick.
+    /// Last-only break: Last or Close triggers exit.
     #[tokio::test]
     async fn collect_stock_snapshot_collects_close() {
         use ibapi::market_data::realtime::TickPrice;
         let ticks = vec![
-            Ok(TickTypes::Price(TickPrice {
-                price: 100.0,
-                tick_type: TickType::Bid,
-                ..Default::default()
-            })),
-            Ok(TickTypes::Price(TickPrice {
-                price: 101.0,
-                tick_type: TickType::Ask,
-                ..Default::default()
-            })),
             Ok(TickTypes::Price(TickPrice {
                 price: 99.0,
                 tick_type: TickType::DelayedClose,
@@ -1282,9 +1270,10 @@ mod tests {
         let stream = futures::stream::iter(ticks);
         let snap = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.close, 99.0);
+        assert_eq!(snap.last, 100.5);
     }
 
-    /// Irrelevant ticks (size, string, generic) are ignored.
+    /// Non-price ticks are silently ignored.
     #[tokio::test]
     async fn collect_stock_snapshot_ignores_non_price_ticks() {
         use ibapi::market_data::realtime::{TickPrice, TickSize};
@@ -1347,15 +1336,6 @@ mod tests {
     async fn collect_option_snapshot_collects_bid_ask_greeks() {
         use ibapi::market_data::realtime::TickPrice;
         let ticks = vec![
-            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
-                implied_volatility: Some(0.25),
-                delta: Some(0.30),
-                gamma: Some(0.02),
-                theta: Some(-0.05),
-                option_price: Some(5.25),
-                underlying_price: Some(100.0),
-                ..Default::default()
-            })),
             Ok(TickTypes::Price(TickPrice {
                 price: 5.0,
                 tick_type: TickType::Bid,
@@ -1364,6 +1344,15 @@ mod tests {
             Ok(TickTypes::Price(TickPrice {
                 price: 5.5,
                 tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                gamma: Some(0.02),
+                theta: Some(-0.05),
+                option_price: Some(5.25),
+                underlying_price: Some(100.0),
                 ..Default::default()
             })),
         ];
