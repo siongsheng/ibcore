@@ -1,0 +1,33 @@
+name: TDD gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+# Least privilege: read the code only.
+permissions:
+  contents: read
+
+concurrency:
+  group: tdd-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tdd-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5  # the check is near-instant; cap a hung runner.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # tdd-check verifies test-before-impl by ANCESTRY, so the full
+          # history of base..head must be present -- a shallow clone breaks it.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Run against the PR's ACTUAL base ref, never a hardcoded `main`.
+      - name: Run tdd-check
+        run: >-
+          python3 bin/tdd-check
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"
