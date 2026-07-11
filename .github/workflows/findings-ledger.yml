@@ -1,0 +1,119 @@
+name: Findings ledger
+
+# Auto-posts the ONE "Review Findings Ledger" comment on a PR once ALL the
+# reviewer checks have finished. Runs a headless Claude Code session in CI
+# (claude-code-action) with the panel plugin installed, so it applies panel's
+# blocker-triage + findings-ledger skills: read every reviewer's output, triage
+# each finding (drop the ~30-40% false blockers), dedupe, and post/edit a single
+# consolidated table -- a clean "no issues found" ledger when nothing survives.
+#
+# ADVISORY: it only reports; it never fails the build. It is NOT a reviewer.
+#
+# SECURITY: workflow_run runs in the BASE repo with secrets + write scope even
+# when the triggering reviewer ran on a fork. This job is therefore gated to
+# SAME-REPO PRs only -- a fork PR must never reach the OAuth token / a
+# Bash-capable agent fed attacker-controlled PR text. (checkout also never uses
+# the head ref, so no untrusted code is executed.)
+#
+# EXACTLY-ONCE: fires on each reviewer's completion, then WAITS (bounded) until
+# no check is still running. concurrency cancels an in-flight waiter when a
+# later reviewer finishes, so the LAST reviewer to complete is the one that
+# writes the ledger -- no self-skip race, no double-post.
+on:
+  workflow_run:
+    workflows: ["Claude Code Review", "Architecture review", "DeepSeek review", "TDD gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read       # gh pr checks reads check-runs (the reviewer workflows)
+  statuses: read     # ...and commit statuses, for the all-checks gate
+
+concurrency:
+  group: findings-ledger-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Same-repo PRs only (never fork PRs -- see SECURITY note above).
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Skip notice (no token)
+        if: env.HAS_TOKEN != 'true'
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN not set -- skipping auto findings ledger."
+
+      - name: Resolve PR + wait until all checks complete
+        if: env.HAS_TOKEN == 'true'
+        run: |
+          set -euo pipefail
+          PR=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+                 --jq 'map(select(.state=="open"))[0].number // empty' || true)
+          if [ -z "$PR" ]; then
+            echo "no open PR for $HEAD_SHA; nothing to do"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          echo "PR=$PR" >> "$GITHUB_ENV"
+          # Wait (bounded) until no check is still running. `gh pr checks` prints
+          # the bucket `pending` for queued/in-progress checks. concurrency
+          # (cancel-in-progress) means a newer reviewer's completion supersedes
+          # this waiter -- so the LAST reviewer to finish proceeds. This also
+          # absorbs the triggering reviewer's own status-propagation lag, so it
+          # never self-skips.
+          for i in $(seq 1 24); do
+            checks=$(gh pr checks "$PR" 2>/dev/null || true)
+            if ! printf '%s\n' "$checks" | grep -qiE '[[:space:]]pending([[:space:]]|$)'; then
+              echo "all checks complete -- writing ledger for PR #$PR"; exit 0
+            fi
+            echo "checks still running (poll $i)…"; sleep 15
+          done
+          echo "timed out waiting for checks; deferring"; echo "SKIP=1" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
+        with:
+          fetch-depth: 0
+          # base default branch only -- never the untrusted head ref.
+
+      - name: Compose findings ledger
+        if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
+        continue-on-error: true   # advisory: a flaky agent run must not show red
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          plugin_marketplaces: 'https://github.com/siongsheng/claude-panel.git'
+          plugins: 'panel@claude-panel'
+          prompt: |
+            Compose the Review Findings Ledger for pull request #${{ env.PR }}
+            in ${{ env.REPO }}. All reviewer checks have completed. Use the
+            panel `blocker-triage` and `findings-ledger` skills.
+
+            1. Gather every reviewer's output on the PR via `gh`: the DeepSeek
+               comment, the Claude /code-review comments, the architecture-review
+               comment(s), and the tdd-gate result. Also read the diff
+               (base..head) for context.
+            2. TRIAGE with blocker-triage: for each raised finding decide real vs
+               false (expect ~30-40% false), set the triaged severity, and check
+               whether it is pre-existing on the base branch. Dedupe findings
+               that multiple reviewers raised into one row.
+            3. Post the SINGLE ledger via findings-ledger, CUMULATIVELY. First
+               fetch the existing "📋 Review Findings Ledger" comment (match by
+               that marker) and MERGE into it -- do NOT regenerate from scratch:
+               preserve every prior row and its ID, change only the Status of
+               resolved findings (mark them ✅ Fixed), append new findings as new
+               rows, and NEVER drop a row a later review no longer reports (a
+               fixed finding stays as a ✅ Fixed row). EDIT that one comment in
+               place (never post a second). Columns: ID | Finding | Source |
+               Severity | Status. Only when the ledger has NEVER existed AND
+               nothing survives triage, post the clean confirmation ("✅ Reviewed
+               -- no issues found") listing which reviewers ran.
+            ADVISORY ONLY: report; do not block or fail. Do not modify code.
