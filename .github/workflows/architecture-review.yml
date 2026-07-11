@@ -1,0 +1,109 @@
+name: Architecture review
+
+# Panel's UNIVERSAL, repo-agnostic architecture reviewer (the Claude-family
+# architecture lens). No plugin dependency: architecture-review criteria are
+# decades-stable, so they live in the prompt rather than tracking a fast-moving
+# third-party skill. For deeper, language-specific depth, `/panel-init` can
+# SUGGEST a stack-matched marketplace skill as an opt-in upgrade -- it does not
+# replace this floor.
+#
+# The prompt below DISTILLS the stable patterns from the surveyed
+# architecture-review skills + literature so the floor captures their substance
+# without their churn/licensing:
+#   - coupling & cohesion as the dominant axes  (SE literature, arXiv:1901.09050)
+#   - dependency-direction & hexagonal/layering rubric   (decebals/java)
+#   - concrete complexity thresholds + refactor roadmap  (pokayokay/srstomp)
+#   - disciplined, evidence-based, high-signal findings   (getsentry code-review)
+#   - architectural-decision (ADR) & trade-off lens        (vasilyu; adr.github.io)
+#   - versioned API contracts, consistent error-handling, externalized config,
+#     right-level abstraction, change-propagation blast radius  (wshobson/agents,
+#     MIT Architecture Review Checklist)
+#
+# The official claude-code-review.yml runs /code-review (correctness/quality),
+# NOT architecture -- this is the complementary architecture lens.
+#
+# Runs on every push to the PR (like the other reviewers) so the LATEST code is
+# always architecture-reviewed; concurrency below cancels an in-flight run on a
+# new push to bound cost. ADVISORY (posts comments, never blocks; hard gates
+# stay deterministic -- bin/tdd-check + the repo's tests/linters).
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+concurrency:
+  group: architecture-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  architecture-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No-op cleanly until CLAUDE_CODE_OAUTH_TOKEN is set (via /install-github-app).
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - name: Skip notice
+        if: env.HAS_TOKEN != 'true'
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN not set -- skipping architecture review. Run /install-github-app to set it, or run the /panel loop locally."
+      - uses: actions/checkout@v4
+        if: env.HAS_TOKEN == 'true'
+        with:
+          fetch-depth: 0
+      - name: Architecture review
+        if: env.HAS_TOKEN == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are an ARCHITECTURE reviewer for pull request
+            #${{ github.event.pull_request.number }}. Correctness/quality is
+            covered by the separate /code-review workflow -- do NOT duplicate it.
+
+            SCOPE: Review the changed commits
+            ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+            (a CI checkout has no unstaged changes, so diff against the base).
+            Judge ONLY what THIS change introduces; list pre-existing debt
+            separately and never block on it.
+
+            Walk this checklist and cite file:line evidence for every finding.
+            COUPLING and COHESION are the dominant concerns -- weight them most.
+            1. BOUNDARIES & COHESION: Does the change respect module/layer
+               boundaries and separation of concerns? Flag logic leaking across
+               layers or a module taking on a second responsibility.
+            2. DEPENDENCY DIRECTION: Do dependencies point toward stable
+               abstractions (domain/core), never domain->infrastructure or
+               stable->volatile? Flag new cycles and inward-pointing violations
+               (Dependency Inversion / ports-and-adapters).
+            3. COMPLEXITY & ABSTRACTION LEVEL: Flag concrete signals, not vibes
+               -- oversized functions/files, deep nesting, high fan-in/fan-out,
+               a new god-object, duplicated structure that should be extracted;
+               AND the reverse -- over-/under-engineering (abstraction that
+               doesn't earn its keep, or a missing seam).
+            4. CONTRACTS, BREAKING CHANGES & BLAST RADIUS: Breaking changes to
+               public API, schema, types, or wire/event formats? Are contracts
+               well-defined and versioned? Trace the change-propagation blast
+               radius -- what else must change or could break downstream?
+            5. ERROR-HANDLING & CONFIGURATION: Does it follow a consistent
+               error-handling strategy (errors propagate, never silently
+               swallowed)? Is configuration externalized rather than hardcoded?
+            6. ARCHITECTURAL DECISIONS: Does the change make a significant,
+               undocumented architectural decision? Are alternatives/trade-offs
+               reasonable? Flag decisions that warrant an ADR or that silently
+               reverse an established pattern or an accepted ADR.
+
+            DISCIPLINE: Be read-only and high-signal -- report only issues you
+            can justify with evidence; do not invent findings to seem thorough,
+            and say so when the architecture is sound. Advisory: post findings
+            as PR comments, do NOT block.
+
+            OUTPUT: findings grouped by the checklist item, each with severity
+            (BLOCKER / SHOULD-FIX / NIT) and file:line; then a short prioritized
+            REFACTOR ROADMAP (highest-leverage fixes first); then one line --
+            VERDICT: APPROVED | CHANGES REQUESTED | BLOCKED, RISK: LOW | MEDIUM
+            | HIGH.
