@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""Deterministic two-commit-TDD checker.
+
+Inspects the commits a branch/PR adds over a base branch (`base..head`)
+and verifies two-commit TDD discipline.
+
+CLASSIFICATION IS PREFIX-PRIMARY, PATH-SECONDARY.
+The conventional-commit prefix is the PRIMARY classifier of a commit's role:
+
+  * `test:` / `test(scope):`        -> TEST (RED) commit
+  * `feat:`/`fix:`/`perf:`/`refactor:` -> IMPL (GREEN) commit
+  * `chore:`/`style:`/`docs:`/`build:`/`ci:` -> NON-CODE/cosmetic (excluded)
+
+This is deliberate: many languages CO-LOCATE unit tests with source. Rust
+puts `#[cfg(test)] mod tests` inside `src/foo.rs`; Python often keeps tests
+(and doctests) beside the code. A path-only classifier calls every such
+commit "impl" and never sees the tests -- it silently no-ops and FALSE-PASSES
+on Rust/Python. The commit message is the one signal that survives
+co-location, so it leads. File paths are a CORROBORATING signal only.
+
+Checks:
+
+  1. RED-before-GREEN by ANCESTRY, not wall-clock time. A `test:` commit must
+     be an ancestor of the `feat:`/`fix:` implementation commit(s). Ancestry
+     survives rebase/amend; committer timestamps do not, so we order commits
+     topologically via `git rev-list`, never by date.
+  2. No bundled commits -- WHEN PATHS ARE DECISIVE. A single commit that
+     touches BOTH a clearly-test-path file (`tests/`, `*_test.*`, ...) AND a
+     clearly-non-test code file is a BLOCKER: split RED from GREEN. Paths
+     CANNOT reveal co-located-test bundling, so there the prefix convention is
+     the enforcement -- a `feat:` commit is trusted not to add new tests, and
+     a `test:` commit touching `src/foo.rs` is NOT flagged bundled.
+  3. CSS/config-only `feat:` downgrade. A `feat:` commit that touches only
+     cosmetic/config files (css/scss/json/yaml/toml/config/constants...) with
+     no test is downgraded from BLOCKER to a SHOULD-FIX warning (suggests a
+     `chore:`/`style:` prefix) -- it does not fail the run.
+  4. Possible-mislabel warning. A `test:` commit that touches zero
+     recognizable test code (no test path, no co-located-test source) and
+     some plain non-test files is a SHOULD-FIX (not a hard fail).
+
+Exit status: 0 when clean or only SHOULD-FIX warnings; non-zero on any
+BLOCKER or on an invalid ref / git error.
+
+Usage:
+    tdd-check [--base <ref>] [--head <ref>]      # defaults: main / HEAD
+
+The classification logic lives in the PURE function `classify_commits`, which
+takes a list of dicts {sha, message, files} in ancestry order (oldest first)
+and returns a Report -- it is unit-testable without a real git repository.
+"""
+
+import argparse
+import dataclasses
+import os
+import re
+import subprocess
+import sys
+from typing import List, Optional, Tuple
+
+# --------------------------------------------------------------------------
+# Severity levels
+# --------------------------------------------------------------------------
+OK = "OK"
+SHOULD_FIX = "SHOULD-FIX"
+BLOCKER = "BLOCKER"
+
+# --------------------------------------------------------------------------
+# Test-file detection patterns.
+#
+# These are intentionally a documented, easy-to-extend constant. A path is a
+# test file if ANY regex below matches its POSIX (forward-slash) form. Add
+# a language by appending a regex here.
+# --------------------------------------------------------------------------
+TEST_PATH_PATTERNS: List[str] = [
+    # A path component named test(s)/__tests__ (any language). NOT spec(s):
+    # a `specs/` dir is the spec-driven-development docs convention, not tests;
+    # real spec *test* files (foo.spec.ts / foo_spec.rb) are caught by the
+    # filename patterns below.
+    r"(^|/)(tests?|__tests__|__test__)(/|$)",
+    # Python:  test_foo.py
+    r"(^|/)test_[^/]+\.py$",
+    # Generic: foo_test.<ext>  (Go: foo_test.go, Python: foo_test.py, ...)
+    r"(^|/)[^/]+_test\.[^/]+$",
+    # JS/TS:   foo.test.<ext>
+    r"(^|/)[^/]+\.test\.[^/]+$",
+    # JS/TS/Ruby-ish: foo.spec.<ext>  /  foo_spec.rb
+    r"(^|/)[^/]+\.spec\.[^/]+$",
+    r"(^|/)[^/]+_spec\.[^/]+$",
+    # Java:    FooTest.java / FooTests.java
+    r"(^|/)[^/]+Tests?\.(java|kt|kts|cs|scala)$",
+]
+_TEST_RE = [re.compile(p) for p in TEST_PATH_PATTERNS]
+
+# --------------------------------------------------------------------------
+# Cosmetic / config file detection (used only for the feat: downgrade).
+# Easy to extend: add an extension or a basename substring hint.
+# --------------------------------------------------------------------------
+COSMETIC_EXTENSIONS = {
+    ".css", ".scss", ".sass", ".less",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".env", ".properties", ".lock",
+}
+COSMETIC_NAME_HINTS = ("config", "constants")
+
+# --------------------------------------------------------------------------
+# Co-located-test source extensions.
+#
+# In these languages unit tests routinely live INSIDE a normal source file
+# (Rust `#[cfg(test)] mod tests` in `src/foo.rs`; Python doctests / tests
+# beside the module). A `test:` commit touching one of these is therefore
+# still touching "test code", so it must NOT trip the possible-mislabel
+# warning. Easy to extend -- add an extension here.
+# --------------------------------------------------------------------------
+COLOCATED_TEST_EXTENSIONS = {".rs", ".py"}
+
+# Conventional-commit prefix, tolerating scope and "!": feat(ui)!: ...
+_PREFIX_RE = re.compile(r"^\s*([a-zA-Z]+)(\([^)]*\))?!?\s*:")
+
+# --------------------------------------------------------------------------
+# Prefix -> TDD role mapping (the PRIMARY classifier).
+#   TEST_PREFIXES  -> RED   (a failing test)
+#   IMPL_PREFIXES  -> GREEN (code that makes tests pass)
+#   COSMETIC_PREFIXES -> non-code / excluded from the RED/GREEN discipline
+# A prefix not listed here (or absent) falls back to path-based inference.
+# --------------------------------------------------------------------------
+TEST_PREFIXES = {"test"}
+IMPL_PREFIXES = {"feat", "fix", "perf", "refactor"}
+COSMETIC_PREFIXES = {"chore", "style", "docs", "build", "ci"}
+
+
+# --------------------------------------------------------------------------
+# Pure helpers
+# --------------------------------------------------------------------------
+def _posix(path: str) -> str:
+    return path.replace("\\", "/").strip()
+
+
+# Documentation/prose files are never test code, whatever their path
+# (e.g. tests/README.md, specs/roadmap.md).
+DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc"}
+
+
+def is_test_file(path: str) -> bool:
+    """True if `path` looks like a test file in any supported language."""
+    p = _posix(path)
+    if p[p.rfind("."):].lower() in DOC_EXTENSIONS and "." in p.rsplit("/", 1)[-1]:
+        return False
+    return any(rx.search(p) for rx in _TEST_RE)
+
+
+def is_cosmetic_file(path: str) -> bool:
+    """True if `path` is a cosmetic/config file (css/scss/json/yaml/...)."""
+    p = _posix(path)
+    base = p.rsplit("/", 1)[-1].lower()
+    _, dot, ext = base.rpartition(".")
+    if dot and ("." + ext) in COSMETIC_EXTENSIONS:
+        return True
+    return any(hint in base for hint in COSMETIC_NAME_HINTS)
+
+
+def is_colocated_test_source(path: str) -> bool:
+    """True if `path` is a source file in a co-located-test language.
+
+    Such a file may legitimately CONTAIN a test even though its path does not
+    look like a test path (Rust `src/foo.rs`, Python `src/mod.py`).
+    """
+    p = _posix(path)
+    base = p.rsplit("/", 1)[-1].lower()
+    _, dot, ext = base.rpartition(".")
+    return bool(dot) and ("." + ext) in COLOCATED_TEST_EXTENSIONS
+
+
+def parse_prefix(message: str) -> Optional[str]:
+    """Return the conventional-commit type (lowercased) or None."""
+    if not message:
+        return None
+    m = _PREFIX_RE.match(message)
+    return m.group(1).lower() if m else None
+
+
+def role_of_prefix(prefix: Optional[str]) -> Optional[str]:
+    """Map a conventional-commit prefix to a TDD role (the PRIMARY signal).
+
+    Returns 'test', 'impl', 'cosmetic', or None (unrecognized -> fall back
+    to path-based inference).
+    """
+    if prefix in TEST_PREFIXES:
+        return "test"
+    if prefix in IMPL_PREFIXES:
+        return "impl"
+    if prefix in COSMETIC_PREFIXES:
+        return "cosmetic"
+    return None
+
+
+# --------------------------------------------------------------------------
+# Report data types
+# --------------------------------------------------------------------------
+@dataclasses.dataclass
+class CommitResult:
+    sha: str
+    short: str
+    prefix: Optional[str]
+    classification: str  # human-facing label: test/impl/cosmetic/bundled/empty
+    severity: str
+    message: str  # verdict / explanation for this commit
+    role: str = ""  # TDD role used for ancestry: test/impl/cosmetic/empty
+
+
+@dataclasses.dataclass
+class Report:
+    commits: List[CommitResult]
+    # Range-level findings not tied to a single commit: (severity, message).
+    range_findings: List[Tuple[str, str]] = dataclasses.field(default_factory=list)
+
+    @property
+    def issues(self) -> List[Tuple[str, str, Optional[str]]]:
+        """All non-OK findings as (severity, message, short_sha_or_None)."""
+        out: List[Tuple[str, str, Optional[str]]] = []
+        for c in self.commits:
+            if c.severity != OK:
+                out.append((c.severity, c.message, c.short))
+        for sev, msg in self.range_findings:
+            out.append((sev, msg, None))
+        return out
+
+    @property
+    def blockers(self) -> int:
+        return sum(1 for sev, _, _ in self.issues if sev == BLOCKER)
+
+    @property
+    def warnings(self) -> int:
+        return sum(1 for sev, _, _ in self.issues if sev == SHOULD_FIX)
+
+    @property
+    def ok(self) -> bool:
+        return self.blockers == 0
+
+
+# --------------------------------------------------------------------------
+# The pure classification core
+# --------------------------------------------------------------------------
+def classify_commits(commits: List[dict]) -> Report:
+    """Classify commits and evaluate two-commit-TDD discipline.
+
+    Args:
+        commits: list of {sha, message, files}, in ANCESTRY order
+                 (oldest ancestor first, newest last). `files` is the list
+                 of paths the commit touches.
+
+    Returns:
+        Report with per-commit results, range-level findings, and derived
+        counts. Pure: no git, no I/O.
+    """
+    results: List[CommitResult] = []
+
+    for c in commits:
+        sha = c.get("sha", "")
+        short = sha[:9] if sha else "?"
+        message = c.get("message", "") or ""
+        prefix = parse_prefix(message)
+
+        files = [f for f in (c.get("files", []) or []) if f and f.strip()]
+
+        # ---- Path signals (SECONDARY / corroborating) ---------------------
+        has_test_path = any(is_test_file(f) for f in files)
+        non_test = [f for f in files if not is_test_file(f)]
+        # The "impl side" for bundling: non-test files that are actual code
+        # (not cosmetic/config). Pairing a test with a README is not bundling.
+        impl_side = [f for f in non_test if not is_cosmetic_file(f)]
+        only_cosmetic = bool(non_test) and not impl_side and not has_test_path
+        has_colocated_src = any(is_colocated_test_source(f) for f in files)
+
+        # ---- Role: PREFIX first, path as fallback -------------------------
+        role = role_of_prefix(prefix)
+        if role is None:
+            if has_test_path and not impl_side:
+                role = "test"
+            elif only_cosmetic:
+                role = "cosmetic"
+            elif not files:
+                role = "empty"
+            else:
+                role = "impl"
+        elif role == "impl" and prefix == "feat" and only_cosmetic:
+            # CSS/config-only feat with no test: downgrade to cosmetic so it
+            # doesn't demand a preceding test, and nudge toward chore:/style:.
+            role = "cosmetic"
+
+        severity = OK
+        verdict = ""
+        classification = role
+
+        if not files:
+            role = "empty"
+            classification = "empty"
+            verdict = "no files touched; nothing to check"
+
+        # ---- Path-decisive bundling (structural, prefix-independent) ------
+        # Only fires when BOTH sides are visible in the paths: a clearly
+        # test-path file AND a clearly non-test code file. Co-located tests
+        # (a test: commit touching only src/foo.rs) have no test-path file,
+        # so they never reach here -- the prefix convention guards them.
+        elif has_test_path and impl_side:
+            classification = "bundled"
+            severity = BLOCKER
+            verdict = ("bundled commit: touches BOTH a test-path file and "
+                       "non-test code -- split the RED test commit from the "
+                       "GREEN implementation commit")
+
+        elif role == "test":
+            if prefix not in TEST_PREFIXES:
+                # inferred from test paths but not labelled test:
+                severity = SHOULD_FIX
+                verdict = "test files with no 'test:' prefix -- prefix it 'test:'"
+            elif not has_test_path and not has_colocated_src:
+                # test: commit touching only plainly-non-test code -> suspect
+                severity = SHOULD_FIX
+                verdict = ("test: commit touches no recognizable test code "
+                           "(no test path, no co-located-test source) -- "
+                           "possible mislabel")
+            else:
+                verdict = "test (RED)"
+
+        elif role == "cosmetic":
+            if prefix == "feat":
+                severity = SHOULD_FIX
+                verdict = ("feat: touches only cosmetic/config files with no "
+                           "test -- use a 'chore:'/'style:' prefix instead")
+            else:
+                verdict = "cosmetic / non-code change (excluded from RED/GREEN)"
+
+        else:  # impl
+            verdict = "implementation (GREEN)"
+
+        results.append(CommitResult(
+            sha=sha, short=short, prefix=prefix,
+            classification=classification, severity=severity,
+            message=verdict, role=role))
+
+    report = Report(commits=results)
+
+    # ---- Range-level RED-before-GREEN (ancestry) evaluation ----------------
+    # Roles drive ancestry (prefix-primary): a co-located `test:` commit is a
+    # RED ancestor even though it edits src/*.rs. Cosmetic commits are
+    # excluded -- they don't require a test.
+    impl_idxs = [i for i, r in enumerate(results) if r.role == "impl"]
+    test_idxs = [i for i, r in enumerate(results) if r.role == "test"]
+
+    if impl_idxs:
+        first_impl = impl_idxs[0]
+        if not test_idxs:
+            report.range_findings.append((
+                SHOULD_FIX,
+                "no test commit found in range: implementation without a "
+                "preceding 'test:' commit (some changes legitimately have no "
+                "tests, but flagging it)"))
+        elif test_idxs[0] > first_impl:
+            report.range_findings.append((
+                BLOCKER,
+                "GREEN before RED: an implementation commit precedes its "
+                "test commit in ancestry -- a 'test:' commit must be an "
+                "ANCESTOR of the implementation it makes pass"))
+
+    return report
+
+
+# --------------------------------------------------------------------------
+# Git plumbing (impure)
+# --------------------------------------------------------------------------
+class GitError(Exception):
+    pass
+
+
+def _git(args: List[str]) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise GitError("git executable not found on PATH")
+    if proc.returncode != 0:
+        raise GitError(proc.stderr.strip() or
+                       f"git {' '.join(args)} failed")
+    return proc.stdout
+
+
+def _rev_parse(ref: str) -> str:
+    # --quiet makes an unknown ref exit non-zero with empty output; translate
+    # any failure here into a clear "cannot resolve ref" message.
+    try:
+        out = _git(
+            ["rev-parse", "--verify", "--quiet", ref + "^{commit}"]).strip()
+    except GitError:
+        out = ""
+    if not out:
+        raise GitError(f"cannot resolve ref: {ref!r} "
+                       "(unknown branch/commit, or not inside a git repo)")
+    return out
+
+
+def collect_commits(base: str, head: str) -> List[dict]:
+    """Return commits in base..head as {sha, message, files}, ancestry order.
+
+    Ancestry order = oldest ancestor first. `git rev-list` yields newest
+    first in topological order; we reverse it. Timestamps are never consulted.
+    """
+    _rev_parse(base)
+    _rev_parse(head)
+    rng = f"{base}..{head}"
+    # --topo-order guarantees ancestry-consistent ordering; --reverse makes
+    # ancestors come before descendants.
+    shas = _git(["rev-list", "--topo-order", "--reverse", rng]).split()
+
+    commits: List[dict] = []
+    for sha in shas:
+        subject = _git(["log", "-1", "--format=%s", sha]).strip()
+        # Files changed by this commit relative to its first parent. For the
+        # very first commit (no parent) diff-tree still lists all files.
+        raw = _git(["diff-tree", "--no-commit-id", "--name-only", "-r",
+                    "--root", sha])
+        files = [ln for ln in raw.splitlines() if ln.strip()]
+        commits.append({"sha": sha, "message": subject, "files": files})
+    return commits
+
+
+# --------------------------------------------------------------------------
+# Reporting / CLI
+# --------------------------------------------------------------------------
+_SEV_LABEL = {OK: "ok", SHOULD_FIX: "SHOULD-FIX", BLOCKER: "BLOCKER"}
+
+
+def render_report(report: Report, base: str, head: str) -> str:
+    lines = []
+    lines.append(f"tdd-check: {base}..{head}")
+    lines.append("=" * 60)
+    if not report.commits:
+        lines.append("No commits in range -- nothing to check.")
+        return "\n".join(lines)
+
+    for c in report.commits:
+        prefix = (c.prefix + ":") if c.prefix else "(no prefix)"
+        lines.append(
+            f"  {c.short}  [{_SEV_LABEL[c.severity]:>10}]  "
+            f"{c.classification:<10}  {prefix:<12}  {c.message}")
+
+    lines.append("-" * 60)
+    if report.range_findings:
+        for sev, msg in report.range_findings:
+            lines.append(f"  [{_SEV_LABEL[sev]}] {msg}")
+        lines.append("-" * 60)
+
+    lines.append(
+        f"blockers: {report.blockers}   should-fix: {report.warnings}")
+    lines.append("RESULT: PASS" if report.ok else "RESULT: FAIL")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="tdd-check",
+        description="Verify two-commit TDD discipline over base..head "
+                    "by ancestry (not timestamps).")
+    parser.add_argument("--base", default="main",
+                        help="base ref (default: main)")
+    parser.add_argument("--head", default="HEAD",
+                        help="head ref (default: HEAD)")
+    args = parser.parse_args(argv)
+
+    try:
+        commits = collect_commits(args.base, args.head)
+    except GitError as exc:
+        print(f"tdd-check: error: {exc}", file=sys.stderr)
+        return 2
+
+    report = classify_commits(commits)
+    print(render_report(report, args.base, args.head))
+    return 0 if report.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
