@@ -460,6 +460,71 @@ mod tests {
         assert!(format!("{e:?}").contains("ApiPending"));
     }
 
+    // ── classify_terminal / OrderOutcome tests ──
+
+    #[test]
+    fn classify_filled_is_terminal_with_price() {
+        let ev = OrderStatusEvent::Filled {
+            order_id: 7,
+            filled_qty: 1.0,
+            avg_price: 6.34,
+            commission: None,
+            execution_id: None,
+        };
+        match classify_terminal(ev) {
+            Some(OrderOutcome::Filled { order_id, filled_qty, avg_price }) => {
+                assert_eq!(order_id, 7);
+                assert_eq!(filled_qty, 1.0);
+                assert_eq!(avg_price, 6.34);
+            }
+            other => panic!("expected Filled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_rejected_is_terminal_with_reason() {
+        let ev = OrderStatusEvent::Rejected { order_id: 8, reason: "no security def".into() };
+        match classify_terminal(ev) {
+            Some(OrderOutcome::Rejected { order_id, reason }) => {
+                assert_eq!(order_id, 8);
+                assert_eq!(reason, "no security def");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_cancelled_is_terminal() {
+        let ev = OrderStatusEvent::Cancelled { order_id: 9, reason: "held".into() };
+        assert!(matches!(
+            classify_terminal(ev),
+            Some(OrderOutcome::Cancelled { order_id: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn classify_inactive_maps_to_rejected() {
+        let ev = OrderStatusEvent::Inactive { order_id: 10 };
+        match classify_terminal(ev) {
+            Some(OrderOutcome::Rejected { order_id, reason }) => {
+                assert_eq!(order_id, 10);
+                assert!(reason.contains("inactive"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_submitted_is_non_terminal() {
+        assert!(classify_terminal(OrderStatusEvent::Submitted { order_id: 11 }).is_none());
+    }
+
+    #[test]
+    fn classify_other_is_non_terminal() {
+        let ev = OrderStatusEvent::Other { order_id: 12, status: "PreSubmitted".into() };
+        assert!(classify_terminal(ev).is_none());
+    }
+
     // ── map_order_status tests ──
 
     #[test]
