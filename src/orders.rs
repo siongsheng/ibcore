@@ -101,6 +101,39 @@ pub enum OrderStatusEvent {
     },
 }
 
+/// Terminal outcome of an order placed via [`IbClient::place_order_await`].
+#[derive(Debug, Clone)]
+pub enum OrderOutcome {
+    /// Order filled. Carries fill quantity and average fill price.
+    Filled {
+        /// API-assigned order ID.
+        order_id: i32,
+        /// Quantity filled.
+        filled_qty: f64,
+        /// Average fill price (combo net price for spreads).
+        avg_price: f64,
+    },
+    /// Order rejected by IB — carries the rejection message.
+    Rejected {
+        /// API-assigned order ID.
+        order_id: i32,
+        /// Rejection reason from IB.
+        reason: String,
+    },
+    /// Order cancelled or went inactive before filling.
+    Cancelled {
+        /// API-assigned order ID.
+        order_id: i32,
+        /// Reason, if any.
+        reason: String,
+    },
+    /// Acknowledged/working but no terminal status within the wait window.
+    Pending {
+        /// API-assigned order ID.
+        order_id: i32,
+    },
+}
+
 /// A stream of live order status updates.
 ///
 /// Wraps an ibapi `Subscription<OrderUpdate>` and maps each item into a
@@ -192,6 +225,29 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
     }
 }
 
+/// Decide whether an order-status event is terminal for `place_order_await`.
+///
+/// Returns `Some(outcome)` to stop waiting, or `None` for non-terminal states
+/// (Submitted / PreSubmitted / PendingSubmit) where we keep listening. Pure
+/// function — the async loop in `place_order_await` is a thin wrapper over it.
+fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
+    match ev {
+        OrderStatusEvent::Filled { order_id, filled_qty, avg_price, .. } => {
+            Some(OrderOutcome::Filled { order_id, filled_qty, avg_price })
+        }
+        OrderStatusEvent::Rejected { order_id, reason } => {
+            Some(OrderOutcome::Rejected { order_id, reason })
+        }
+        OrderStatusEvent::Cancelled { order_id, reason } => {
+            Some(OrderOutcome::Cancelled { order_id, reason })
+        }
+        OrderStatusEvent::Inactive { order_id } => {
+            Some(OrderOutcome::Rejected { order_id, reason: "order went inactive".to_string() })
+        }
+        OrderStatusEvent::Submitted { .. } | OrderStatusEvent::Other { .. } => None,
+    }
+}
+
 /// Normalize an IB execution ID string: empty strings are coerced to `None`,
 /// preserving non-empty values. This prevents `Some("")` which would force
 /// every consumer to check for empty strings.
@@ -238,6 +294,58 @@ impl IbClient {
             })?;
 
         Ok(order_id)
+    }
+
+    /// Submit an order and wait (up to `timeout`) for a terminal status.
+    ///
+    /// Unlike the fire-and-forget [`place_order`](Self::place_order) (which
+    /// wraps `submit_order` and never learns the outcome), this uses ibapi's
+    /// `place_order` — which registers the order id so its status/execution/
+    /// error messages route back on the returned subscription. The caller thus
+    /// learns the actual fill price or the rejection reason instead of
+    /// assuming success. Returns [`OrderOutcome::Pending`] if no terminal
+    /// status arrives within `timeout` (the order may still be working).
+    pub async fn place_order_await(
+        &self,
+        order_id: i32,
+        contract: &Contract,
+        order: &Order,
+        timeout: std::time::Duration,
+    ) -> Result<OrderOutcome, IbError> {
+        let sub = self
+            .inner()
+            .place_order(order_id, contract, order)
+            .await
+            .map_err(|e| IbError::OrderRejected {
+                code: 0,
+                message: format!("place_order failed: {e}"),
+                rejection_json: None,
+            })?;
+
+        let outcome = tokio::time::timeout(timeout, async {
+            let mut data = sub.filter_data();
+            while let Some(item) = data.next().await {
+                match item {
+                    Ok(ibapi::orders::PlaceOrder::OrderStatus(s)) => {
+                        if let Some(outcome) = classify_terminal(map_order_status(&s)) {
+                            return outcome;
+                        }
+                        // non-terminal (Submitted / PreSubmitted / PendingSubmit) — keep waiting
+                    }
+                    // OpenOrder / ExecutionData / CommissionReport — not terminal here.
+                    Ok(_) => continue,
+                    // IB delivers order rejections as an error on this subscription.
+                    Err(e) => {
+                        return OrderOutcome::Rejected { order_id, reason: e.to_string() };
+                    }
+                }
+            }
+            OrderOutcome::Pending { order_id }
+        })
+        .await
+        .unwrap_or(OrderOutcome::Pending { order_id });
+
+        Ok(outcome)
     }
 
     /// Cancel an open order by order_id.
