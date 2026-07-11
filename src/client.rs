@@ -105,6 +105,11 @@ impl IbClient {
         self.inner.server_version()
     }
 
+    /// Whether this client is connected to a paper (simulation) account.
+    pub fn account_type(&self) -> AccountType {
+        self.account_type
+    }
+
     /// Fetch contract_details with caching.
     ///
     /// Checks the in-memory cache before calling the IB API. Cache is keyed
