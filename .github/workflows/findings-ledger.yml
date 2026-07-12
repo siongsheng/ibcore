@@ -16,22 +16,29 @@ name: Findings ledger
 # the head ref, so no untrusted code is executed.)
 #
 # EXACTLY-ONCE: fires on each reviewer's completion, then WAITS (bounded) until
-# no check is still running. concurrency cancels an in-flight waiter when a
-# later reviewer finishes, so the LAST reviewer to complete is the one that
-# writes the ledger -- no self-skip race, no double-post.
+# none of the REVIEWER checks (below) are still running -- other repo checks are
+# ignored, so an unrelated pending check can't stall the ledger. concurrency
+# cancels an in-flight waiter when a later reviewer finishes, so the LAST
+# reviewer to complete writes the ledger -- no self-skip race, no double-post.
 on:
   workflow_run:
+    # NAME CONTRACT: each entry MUST exactly match a reviewer workflow's `name:`.
+    # These are also the names the waiter filters on (REVIEWERS below). Rename a
+    # reviewer without updating BOTH places and the ledger silently stops firing.
     workflows: ["Claude Code Review", "Architecture review", "DeepSeek review", "TDD gate"]
     types: [completed]
 
 permissions:
   contents: read
   pull-requests: write
-  checks: read       # gh pr checks reads check-runs (the reviewer workflows)
-  statuses: read     # ...and commit statuses, for the all-checks gate
+  actions: read      # read reviewer workflow-RUN status for the completion gate
+                     # (robust to the empty-combined-status "pending" quirk that
+                     # made gh-pr-checks bucket detection time out)
 
 concurrency:
-  group: findings-ledger-${{ github.event.workflow_run.head_branch }}
+  # Key by PR when resolvable (same-repo PRs populate pull_requests), else the
+  # branch -- so two PRs from one branch don't cancel each other's ledger.
+  group: findings-ledger-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
 jobs:
@@ -47,12 +54,14 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       REPO: ${{ github.repository }}
+      # Must match the `workflows:` list above (the reviewer workflow names).
+      REVIEWERS: 'Claude Code Review|Architecture review|DeepSeek review|TDD gate'
     steps:
       - name: Skip notice (no token)
         if: env.HAS_TOKEN != 'true'
         run: echo "CLAUDE_CODE_OAUTH_TOKEN not set -- skipping auto findings ledger."
 
-      - name: Resolve PR + wait until all checks complete
+      - name: Resolve PR + wait until reviewer checks complete
         if: env.HAS_TOKEN == 'true'
         run: |
           set -euo pipefail
@@ -62,20 +71,27 @@ jobs:
             echo "no open PR for $HEAD_SHA; nothing to do"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0
           fi
           echo "PR=$PR" >> "$GITHUB_ENV"
-          # Wait (bounded) until no check is still running. `gh pr checks` prints
-          # the bucket `pending` for queued/in-progress checks. concurrency
-          # (cancel-in-progress) means a newer reviewer's completion supersedes
-          # this waiter -- so the LAST reviewer to finish proceeds. This also
-          # absorbs the triggering reviewer's own status-propagation lag, so it
-          # never self-skips.
+          # Wait (bounded) until every REVIEWER workflow RUN on this head has
+          # completed. Gate on the Actions RUN status (needs actions: read), NOT
+          # `gh pr checks` buckets: when a PR's reviewers post no commit status,
+          # the commit's COMBINED status stays "pending" (GitHub's default with
+          # 0 statuses), which fooled bucket detection into a perpetual "pending"
+          # -> 6min timeout -> SKIP -> the ledger silently never posted.
+          # concurrency (cancel-in-progress) supersedes this waiter when a later
+          # reviewer finishes, so the LAST reviewer proceeds.
           for i in $(seq 1 24); do
-            checks=$(gh pr checks "$PR" 2>/dev/null || true)
-            if ! printf '%s\n' "$checks" | grep -qiE '[[:space:]]pending([[:space:]]|$)'; then
-              echo "all checks complete -- writing ledger for PR #$PR"; exit 0
+            running=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" 2>/dev/null \
+              | jq --arg r "$REVIEWERS" \
+                  '[.workflow_runs[] | select(.name|test("^(" + $r + ")$")) | select(.status != "completed")] | length' \
+              2>/dev/null || echo 1)
+            running=${running:-1}
+            if [ "$running" = "0" ]; then
+              echo "all reviewer runs complete -- writing ledger for PR #$PR"; exit 0
             fi
-            echo "checks still running (poll $i)…"; sleep 15
+            echo "reviewer runs still running: $running (poll $i)…"; sleep 15
           done
-          echo "timed out waiting for checks; deferring"; echo "SKIP=1" >> "$GITHUB_ENV"
+          echo "::notice title=Findings ledger::Timed out waiting for reviewer checks on PR #$PR; ledger not posted this run."
+          echo "SKIP=1" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
@@ -83,6 +99,43 @@ jobs:
           fetch-depth: 0
           # base default branch only -- never the untrusted head ref.
 
+      # Pre-gather every reviewer input deterministically in bash so the agent
+      # does PURE judgment (read files -> triage -> write one file) instead of
+      # ~20 gh round-trips. This is the main turn/latency/cost reducer: the old
+      # gh-driven prompt ran ~39 turns; the deterministic I/O needs no model.
+      - name: Gather ledger inputs
+        if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
+        run: |
+          set -euo pipefail
+          mkdir -p .ledger-inputs
+          # NOTE: ?per_page=100 (no --paginate) fetches ONE JSON array = the
+          # newest 100 of each. The ledger is created early so it stays on page
+          # 1; only a PR with >100 comments could drop later reviewer text.
+          gh api "repos/$REPO/issues/$PR/comments?per_page=100" > .ledger-inputs/issue-comments.json
+          gh api "repos/$REPO/pulls/$PR/reviews?per_page=100"   > .ledger-inputs/reviews.json
+          gh api "repos/$REPO/pulls/$PR/comments?per_page=100"  > .ledger-inputs/review-comments.json
+          gh pr diff "$PR" > .ledger-inputs/diff.patch 2>/dev/null \
+            || { echo "::warning title=Findings ledger::gh pr diff failed -- ledger will triage without diff context."; : > .ledger-inputs/diff.patch; }
+          # Existing ledger body for the CUMULATIVE merge (the compose agent reads
+          # this). The comment id for PATCH is resolved fresh at post time by
+          # post_sticky_comment.py, so it's not captured here.
+          # (.body // "") guards against a null comment body breaking startswith.
+          MARK='## 📋 Review Findings Ledger'
+          jq -r --arg m "$MARK" '[.[] | select((.body // "")|startswith($m))] | last | .body // ""' \
+            .ledger-inputs/issue-comments.json > .ledger-inputs/existing.md
+          # One flat markdown of every reviewer's output (excluding the ledger
+          # itself) -- the agent reads this ONE file instead of parsing JSON.
+          {
+            jq -r --arg m "$MARK" '.[] | select(((.body // "")|startswith($m))|not) | "\n### issue comment by @\(.user.login)\n\(.body)"' .ledger-inputs/issue-comments.json
+            jq -r '.[] | select(.body != null and .body != "") | "\n### review by @\(.user.login) [\(.state)]\n\(.body)"' .ledger-inputs/reviews.json
+            jq -r '.[] | "\n### inline comment by @\(.user.login) (\(.path):\(.line // .original_line // "?"))\n\(.body)"' .ledger-inputs/review-comments.json
+          } > .ledger-inputs/reviewer_outputs.md
+          echo "gathered $(jq length .ledger-inputs/issue-comments.json) issue comments; existing ledger present=$([ -s .ledger-inputs/existing.md ] && echo yes || echo no)"
+
+      # The agent does ONLY judgment: read the pre-gathered files, triage, and
+      # WRITE the merged ledger to a file. It posts nothing (next step does) and
+      # touches no gh/git -- so the task is small and bounded enough to run on
+      # Haiku with a turn cap, cutting the ~39-turn / ~4min / ~$1.21 Sonnet run.
       - name: Compose findings ledger
         if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
         continue-on-error: true   # advisory: a flaky agent run must not show red
@@ -92,28 +145,53 @@ jobs:
           github_token: ${{ github.token }}
           plugin_marketplaces: 'https://github.com/siongsheng/claude-panel.git'
           plugins: 'panel@claude-panel'
+          claude_args: '--model claude-haiku-4-5-20251001 --max-turns 15 --allowed-tools "Read,Write,Grep,Glob"'
           prompt: |
-            Compose the Review Findings Ledger for pull request #${{ env.PR }}
-            in ${{ env.REPO }}. All reviewer checks have completed. Use the
-            panel `blocker-triage` and `findings-ledger` skills.
+            Compose the Review Findings Ledger for PR #${{ env.PR }} in ${{ env.REPO }}.
+            Every reviewer input is ALREADY gathered as files in `.ledger-inputs/`.
+            Do NOT call gh or git. Read these files:
+              - reviewer_outputs.md : every reviewer's output (DeepSeek, Claude
+                /code-review, architecture review, inline comments)
+              - diff.patch          : the PR diff, for context
+              - existing.md         : the CURRENT ledger body (empty if none yet)
 
-            1. Gather every reviewer's output on the PR via `gh`: the DeepSeek
-               comment, the Claude /code-review comments, the architecture-review
-               comment(s), and the tdd-gate result. Also read the diff
-               (base..head) for context.
-            2. TRIAGE with blocker-triage: for each raised finding decide real vs
-               false (expect ~30-40% false), set the triaged severity, and check
-               whether it is pre-existing on the base branch. Dedupe findings
-               that multiple reviewers raised into one row.
-            3. Post the SINGLE ledger via findings-ledger, CUMULATIVELY. First
-               fetch the existing "📋 Review Findings Ledger" comment (match by
-               that marker) and MERGE into it -- do NOT regenerate from scratch:
-               preserve every prior row and its ID, change only the Status of
-               resolved findings (mark them ✅ Fixed), append new findings as new
-               rows, and NEVER drop a row a later review no longer reports (a
-               fixed finding stays as a ✅ Fixed row). EDIT that one comment in
-               place (never post a second). Columns: ID | Finding | Source |
-               Severity | Status. Only when the ledger has NEVER existed AND
-               nothing survives triage, post the clean confirmation ("✅ Reviewed
-               -- no issues found") listing which reviewers ran.
-            ADVISORY ONLY: report; do not block or fail. Do not modify code.
+            Apply the panel `blocker-triage` and `findings-ledger` skills:
+            1. TRIAGE every finding: real vs false (expect ~30-40% false), set the
+               triaged severity, check whether it is pre-existing on the base
+               branch (only defects THIS PR introduced can block), and dedupe
+               findings multiple reviewers raised into ONE row (list all sources).
+            2. MERGE cumulatively into `existing.md`: preserve every prior row and
+               its ID, change only Status as findings resolve (✅ Fixed, ❌
+               Rejected, 📋 Deferred → #N), append new findings with the next ID,
+               never drop a row. If existing.md is empty AND nothing survives
+               triage, produce the clean "✅ Reviewed — no issues found" ledger
+               naming which reviewers ran.
+            3. WRITE the COMPLETE updated ledger markdown to
+               `.ledger-inputs/ledger.md`. It MUST begin with the exact line
+               `## 📋 Review Findings Ledger` and contain the table with columns:
+               ID | Finding | Source | Severity | Status.
+
+            Write ONLY that file. Post nothing (a later step posts it). Do not
+            modify code.
+
+      # Deterministic post: PATCH the existing ledger comment or POST a new one.
+      # Moving the post out of the agent makes it reliable AND makes a missing
+      # ledger.md a LOUD ::error:: instead of a silent green no-op (see #28).
+      - uses: actions/setup-python@v5
+        if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
+        with:
+          python-version: '3.12'
+      # Deterministic, unit-tested post of the ONE sticky ledger comment
+      # (normalize fenced output -> assert marker -> edit-in-place, else create).
+      # Shared logic lives in scripts/post_sticky_comment.py so the fence/marker/
+      # dedup edge cases are tested, not re-inlined per workflow. It does its OWN
+      # fresh comment lookup by marker (so `existing_id.txt` is no longer needed
+      # for posting, and the post is immune to a stale gather-time snapshot).
+      # ADVISORY: a missing/malformed file or transient gh error is a loud
+      # ::error:: but never fails the build.
+      - name: Post ledger
+        if: env.HAS_TOKEN == 'true' && env.SKIP != '1'
+        run: |
+          python3 scripts/post_sticky_comment.py "$PR" \
+            --marker '## 📋 Review Findings Ledger' \
+            --body-file .ledger-inputs/ledger.md
