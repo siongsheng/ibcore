@@ -26,13 +26,21 @@ name: Architecture review
 # always architecture-reviewed; concurrency below cancels an in-flight run on a
 # new push to bound cost. ADVISORY (posts comments, never blocks; hard gates
 # stay deterministic -- bin/tdd-check + the repo's tests/linters).
+#
+# POSTING: the agent COMPOSES its review to a file; a deterministic bash step
+# POSTS it as ONE sticky comment (edit-in-place). claude-code-action's own
+# posting model classifies INLINE comments and posts nothing for a clean/grouped
+# review -- so relying on it made this reviewer a silent no-op. Composing to a
+# file + posting in bash guarantees the review is ALWAYS visible (even when
+# clean) and a run that produces nothing is a loud ::error::, never a green
+# no-op.
 on:
   pull_request:
     types: [opened, ready_for_review, reopened, synchronize]
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write   # post/update the ONE sticky architecture-review comment
   issues: read
   id-token: write
 
@@ -47,27 +55,56 @@ jobs:
     # No-op cleanly until CLAUDE_CODE_OAUTH_TOKEN is set (via /install-github-app).
     env:
       HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      # STICKY MARKER (load-bearing): this string must stay byte-identical in THREE
+      # places -- this env var, the prompt's mandated first line of arch-review.md,
+      # and the Post step's grep/jq lookup. Change one without the others and the
+      # sticky-edit silently breaks into duplicate comments.
+      MARK: '## 🏛️ Architecture Review'
     steps:
       - name: Skip notice
         if: env.HAS_TOKEN != 'true'
         run: echo "CLAUDE_CODE_OAUTH_TOKEN not set -- skipping architecture review. Run /install-github-app to set it, or run the /panel loop locally."
+
       - uses: actions/checkout@v4
         if: env.HAS_TOKEN == 'true'
         with:
           fetch-depth: 0
-      - name: Architecture review
+
+      # Pre-gather the diff so the agent reads a file instead of shelling out; it
+      # still uses Read/Grep/Glob on the checkout to inspect the WIDER codebase
+      # (coupling, dependency direction, blast radius).
+      - name: Gather diff
         if: env.HAS_TOKEN == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .arch-review
+          if ! gh pr diff "$PR" > .arch-review/diff.patch 2>/dev/null; then
+            echo "::warning title=Architecture review::gh pr diff failed -- reviewing an EMPTY diff (check gh/token)."
+            : > .arch-review/diff.patch
+          fi
+          echo "diff bytes: $(wc -c < .arch-review/diff.patch)"
+
+      # The agent ANALYZES and WRITES its review to a file; it posts nothing (the
+      # next step does). Deep-reasoning work -- keep the default model, NOT Haiku
+      # (unlike the findings-ledger's mechanical compose step).
+      - name: Compose architecture review
+        if: env.HAS_TOKEN == 'true'
+        continue-on-error: true   # advisory: a flaky agent run must not show red
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}   # explicit token for the action's own GitHub API ops
+          claude_args: '--allowed-tools "Read,Write,Grep,Glob"'
           prompt: |
-            You are an ARCHITECTURE reviewer for pull request
-            #${{ github.event.pull_request.number }}. Correctness/quality is
-            covered by the separate /code-review workflow -- do NOT duplicate it.
+            You are an ARCHITECTURE reviewer for PR #${{ env.PR }}.
+            Correctness/quality is covered by the separate /code-review workflow
+            -- do NOT duplicate it.
 
-            SCOPE: Review the changed commits
-            ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
-            (a CI checkout has no unstaged changes, so diff against the base).
+            The PR diff is in `.arch-review/diff.patch`. Read it, and use
+            Read/Grep/Glob on the repo to inspect the WIDER codebase for context.
             Judge ONLY what THIS change introduces; list pre-existing debt
             separately and never block on it.
 
@@ -97,13 +134,37 @@ jobs:
                reasonable? Flag decisions that warrant an ADR or that silently
                reverse an established pattern or an accepted ADR.
 
-            DISCIPLINE: Be read-only and high-signal -- report only issues you
-            can justify with evidence; do not invent findings to seem thorough,
-            and say so when the architecture is sound. Advisory: post findings
-            as PR comments, do NOT block.
+            DISCIPLINE: read-only and high-signal -- report only issues you can
+            justify with evidence; do not invent findings to seem thorough, and
+            say so plainly when the architecture is sound.
 
-            OUTPUT: findings grouped by the checklist item, each with severity
-            (BLOCKER / SHOULD-FIX / NIT) and file:line; then a short prioritized
-            REFACTOR ROADMAP (highest-leverage fixes first); then one line --
+            WRITE your review to `.arch-review/arch-review.md` -- post nothing, a
+            later step posts it. The file MUST BEGIN with this EXACT line:
+            ## 🏛️ Architecture Review
+            Then: findings grouped by checklist item, each with severity
+            (BLOCKER / SHOULD-FIX / NIT) and file:line; a short prioritized
+            REFACTOR ROADMAP (highest-leverage first); and a final line --
             VERDICT: APPROVED | CHANGES REQUESTED | BLOCKED, RISK: LOW | MEDIUM
-            | HIGH.
+            | HIGH. If the architecture is sound, STILL write the file: state
+            "No architectural issues found." with VERDICT: APPROVED. Do not
+            modify code.
+
+      # Deterministic post of ONE sticky architecture-review comment (edit in
+      # place, else create). ALWAYS posts -- a clean review stays visible, not
+      # silent -- and a missing/malformed file is a loud ::error::, never a green
+      # no-op.
+      - uses: actions/setup-python@v5
+        if: env.HAS_TOKEN == 'true'
+        with:
+          python-version: '3.12'
+      # Deterministic, unit-tested post of ONE sticky architecture-review comment
+      # (normalize fenced output -> assert marker -> edit-in-place, else create).
+      # Shared logic lives in scripts/post_sticky_comment.py so the fence/marker/
+      # dedup edge cases are tested, not re-inlined per workflow. ADVISORY: a
+      # missing/malformed file or a transient gh error is a loud ::error:: but
+      # never fails the build.
+      - name: Post architecture review
+        if: env.HAS_TOKEN == 'true'
+        run: |
+          python3 scripts/post_sticky_comment.py "$PR" \
+            --marker "$MARK" --body-file .arch-review/arch-review.md
