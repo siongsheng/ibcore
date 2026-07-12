@@ -25,6 +25,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Self-test: prove the vendored checker actually works in THIS repo's CI,
+      # not merely upstream. `/panel-init` vendors bin/test_tdd_check.py next to
+      # bin/tdd-check; if a repo vendored the checker before this step existed,
+      # skip cleanly (re-run /panel-init to add the tests).
+      - name: Self-test tdd-check (if vendored)
+        run: |
+          if [ -f bin/test_tdd_check.py ]; then
+            python3 bin/test_tdd_check.py
+          else
+            echo "::notice::bin/test_tdd_check.py not vendored — re-run /panel-init to enable the tdd-check self-test."
+          fi
       # Run against the PR's ACTUAL base ref, never a hardcoded `main`.
       - name: Run tdd-check
         run: >-
