@@ -120,8 +120,21 @@ pub enum OrderOutcome {
         /// Rejection reason from IB.
         reason: String,
     },
-    /// Order cancelled or went inactive before filling.
+    /// Order was explicitly cancelled before filling.
     Cancelled {
+        /// API-assigned order ID.
+        order_id: i32,
+        /// Reason, if any.
+        reason: String,
+    },
+    /// Order went inactive — IB accepted the message but the order is not
+    /// working. This is distinct from both [`Rejected`](Self::Rejected) (a hard
+    /// broker refusal) and [`Cancelled`](Self::Cancelled) (an explicit cancel):
+    /// IB reports `Inactive` for cases as varied as an invalid order that
+    /// triggered an error, or an order submitted while the market is closed.
+    /// Callers that only need "did not fill" can treat it like `Cancelled`;
+    /// the variant exists so callers that care can tell them apart.
+    Inactive {
         /// API-assigned order ID.
         order_id: i32,
         /// Reason, if any.
@@ -242,9 +255,40 @@ fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
             Some(OrderOutcome::Cancelled { order_id, reason })
         }
         OrderStatusEvent::Inactive { order_id } => {
-            Some(OrderOutcome::Rejected { order_id, reason: "order went inactive".to_string() })
+            Some(OrderOutcome::Inactive { order_id, reason: "order went inactive".to_string() })
         }
         OrderStatusEvent::Submitted { .. } | OrderStatusEvent::Other { .. } => None,
+    }
+}
+
+/// Build an [`IbError::OrderRejected`] from an order-submission failure,
+/// preserving the underlying IB error code (and any advanced-reject JSON) when
+/// the ibapi error is a [`Notice`](ibapi::Notice). Non-`Notice` errors
+/// (connection / IO / shutdown) carry no IB code, so `code: 0` is used and the
+/// original error is recorded in the message for diagnosis. Addresses #14,
+/// where every failure previously reported a meaningless `code: 0`.
+///
+/// Note: unlike [`classify_notice`](crate::errors::classify_notice), this always
+/// yields [`IbError::OrderRejected`] — even for a `Notice` whose code is outside
+/// the 200–299 order-rejection range (e.g. a 502 raised while submitting). In an
+/// order-submission context "the order didn't go through" is the salient fact;
+/// the real code is still preserved for diagnosis rather than flattened to 0.
+fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
+    match err {
+        ibapi::Error::Notice(notice) => IbError::OrderRejected {
+            code: notice.code,
+            message: format!("{context}: {}", notice.message),
+            rejection_json: if notice.advanced_order_reject_json.is_empty() {
+                None
+            } else {
+                Some(notice.advanced_order_reject_json.clone())
+            },
+        },
+        other => IbError::OrderRejected {
+            code: 0,
+            message: format!("{context}: {other}"),
+            rejection_json: None,
+        },
     }
 }
 
@@ -278,20 +322,12 @@ impl IbClient {
             .inner()
             .next_valid_order_id()
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("failed to get order ID: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("failed to get order ID", &e))?;
 
         self.inner()
             .submit_order(order_id, contract, order)
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("submit_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("submit_order failed", &e))?;
 
         Ok(order_id)
     }
@@ -305,6 +341,15 @@ impl IbClient {
     /// learns the actual fill price or the rejection reason instead of
     /// assuming success. Returns [`OrderOutcome::Pending`] if no terminal
     /// status arrives within `timeout` (the order may still be working).
+    ///
+    /// # Rejection vs. inactive
+    /// IB delivers a rejection as up to two messages on this subscription — an
+    /// error/`Notice` and an `OrderStatus` with status `Inactive`. This loop
+    /// returns on whichever arrives first, so a rejected order may surface as
+    /// either [`OrderOutcome::Rejected`] (error seen first) or
+    /// [`OrderOutcome::Inactive`] (status seen first). Callers must therefore
+    /// treat `Inactive` as "did not fill — possibly rejected", not as a benign
+    /// working state.
     pub async fn place_order_await(
         &self,
         order_id: i32,
@@ -316,11 +361,7 @@ impl IbClient {
             .inner()
             .place_order(order_id, contract, order)
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("place_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("place_order failed", &e))?;
 
         let outcome = tokio::time::timeout(timeout, async {
             let mut data = sub.filter_data();
@@ -357,11 +398,7 @@ impl IbClient {
             .inner()
             .cancel_order(order_id, "")
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("cancel_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("cancel_order failed", &e))?;
         Ok(())
     }
 
@@ -611,14 +648,73 @@ mod tests {
     }
 
     #[test]
-    fn classify_inactive_maps_to_rejected() {
+    fn classify_inactive_maps_to_inactive() {
+        // Issue #13: IB `Inactive` is neither a hard rejection nor an explicit
+        // cancel, so it maps to its own terminal variant rather than Rejected.
         let ev = OrderStatusEvent::Inactive { order_id: 10 };
         match classify_terminal(ev) {
-            Some(OrderOutcome::Rejected { order_id, reason }) => {
+            Some(OrderOutcome::Inactive { order_id, reason }) => {
                 assert_eq!(order_id, 10);
                 assert!(reason.contains("inactive"));
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Inactive, got {other:?}"),
+        }
+    }
+
+    // ── order_rejected_from (issue #14) ──
+
+    #[test]
+    fn order_rejected_from_notice_preserves_code_and_json() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 201,
+            message: "Order rejected - insufficient margin".into(),
+            error_time: None,
+            advanced_order_reject_json: "{\"orderId\":5}".into(),
+        });
+        match order_rejected_from("submit_order failed", &err) {
+            IbError::OrderRejected { code, message, rejection_json } => {
+                assert_eq!(code, 201);
+                assert!(message.starts_with("submit_order failed:"));
+                assert!(message.contains("insufficient margin"));
+                assert_eq!(rejection_json.as_deref(), Some("{\"orderId\":5}"));
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_rejected_from_notice_empty_json_is_none() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 321,
+            message: "Error validating request".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_rejected_from("submit_order failed", &err) {
+            IbError::OrderRejected { code, rejection_json, .. } => {
+                assert_eq!(code, 321);
+                assert!(rejection_json.is_none());
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_rejected_from_non_notice_falls_back_to_zero() {
+        // Connection / IO / shutdown errors carry no IB code — code 0, but the
+        // original error is preserved in the message for diagnosis.
+        let err = ibapi::Error::ConnectionFailed;
+        let underlying = err.to_string();
+        match order_rejected_from("place_order failed", &err) {
+            IbError::OrderRejected { code, message, rejection_json } => {
+                assert_eq!(code, 0);
+                assert!(message.starts_with("place_order failed:"));
+                // The underlying error text must survive into the message so the
+                // failure is diagnosable — not just the context prefix.
+                assert!(message.contains(&underlying), "message dropped the underlying error: {message}");
+                assert!(rejection_json.is_none());
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
         }
     }
 
