@@ -37,7 +37,7 @@ use tokio::sync::broadcast;
 use tracing;
 
 use crate::{
-    contract::build_option_contract,
+    contract::{build_option_contract, DEFAULT_OPTION_MULTIPLIER},
     diagnostics::{
         classify_farm, AccountType, ConnectionState, DiagnosticEvent,
     },
@@ -133,6 +133,54 @@ impl IbClient {
             cache.insert(key, details.clone());
         }
         Ok(details)
+    }
+
+    /// Resolve a contract to its `ContractDetails` via [`cached_contract_details`],
+    /// trying the preferred exchange first and falling back to IB smart routing
+    /// (empty exchange) when the preferred one yields nothing.
+    ///
+    /// Shared by [`option_snapshot`](Self::option_snapshot) and
+    /// [`option_strikes_for_expiry`](Self::option_strikes_for_expiry), which both
+    /// need the same fallback discipline. Fallback order: `[exchange]` when
+    /// `exchange` is empty or `"SMART"` (nothing more to try), otherwise
+    /// `[exchange, ""]`. Returns the first non-empty `ContractDetails` list; if
+    /// every attempt is empty or errors, returns the last error seen, or a
+    /// [`IbError::ContractResolution`] built from `desc` when there was none.
+    ///
+    /// `desc` is a human-readable contract descriptor (e.g. `"SPY 20260717 700"`)
+    /// used only in log and error messages.
+    async fn resolve_contract_with_exchange_fallback(
+        &self,
+        contract: &ibapi::contracts::Contract,
+        exchange: &str,
+        desc: &str,
+    ) -> Result<Vec<ibapi::contracts::ContractDetails>, IbError> {
+        let exchanges_to_try = if exchange.is_empty() || exchange == "SMART" {
+            vec![exchange.to_string()]
+        } else {
+            vec![exchange.to_string(), String::new()]
+        };
+
+        let mut last_err = None;
+        for ex in &exchanges_to_try {
+            let mut c = contract.clone();
+            c.exchange = ex.as_str().into();
+            match self.cached_contract_details(&c).await {
+                Ok(d) if !d.is_empty() => return Ok(d),
+                Ok(_) => {
+                    last_err = Some(IbError::ContractResolution(format!(
+                        "contract_details returned empty for {desc} on {ex}"
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!("contract_details failed for {desc} on {ex}: {e}");
+                    last_err = Some(IbError::from(e));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            IbError::ContractResolution(format!("contract_details failed for {desc}"))
+        }))
     }
 
     /// Subscribe to the diagnostic event stream.
@@ -527,49 +575,22 @@ impl IbClient {
             last_trade_date_or_contract_month: expiry_str.clone(),
             strike,
             right: Some(right),
-            multiplier: "100".into(),
+            // Assumes standard US-equity options (multiplier 100). Non-standard
+            // multipliers (e.g. 50/1000 index options, post-split contracts) are
+            // not currently supported — see DEFAULT_OPTION_MULTIPLIER.
+            multiplier: DEFAULT_OPTION_MULTIPLIER.into(),
             ..Default::default()
         };
 
         // Resolve via contract_details — try preferred exchange first,
         // then fall back to empty exchange (IB smart routing) if that fails.
-        let exchanges_to_try = if exchange.is_empty() || exchange == "SMART" {
-            vec![exchange.to_string()]
-        } else {
-            vec![exchange.to_string(), String::new()]
-        };
-
-        let mut last_err = None;
-        let mut details = None;
-        for ex in &exchanges_to_try {
-            let mut c = contract.clone();
-            c.exchange = ex.as_str().into();
-            match self.cached_contract_details(&c).await {
-                Ok(d) if !d.is_empty() => {
-                    details = Some(d);
-                    break;
-                }
-                Ok(_) => {
-                    last_err = Some(IbError::ContractResolution(format!(
-                        "contract_details returned empty for {symbol} {expiry_str} {strike} on {ex}"
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "contract_details failed for {symbol} {expiry_str} {strike} on {ex}: {e}"
-                    );
-                    last_err = Some(IbError::from(e));
-                }
-            }
-        }
-
-        let details = details.ok_or_else(|| {
-            last_err.unwrap_or_else(|| {
-                IbError::ContractResolution(format!(
-                    "contract_details failed for {symbol} {expiry_str} {strike}"
-                ))
-            })
-        })?;
+        let details = self
+            .resolve_contract_with_exchange_fallback(
+                &contract,
+                exchange,
+                &format!("{symbol} {expiry_str} {strike}"),
+            )
+            .await?;
         let resolved = details.first().ok_or_else(|| {
             IbError::ContractResolution(format!(
                 "no contract details for {symbol} {expiry_str} {strike}"
@@ -606,47 +627,34 @@ impl IbClient {
         let expiry_str = format!("{year:04}{month:02}{day:02}");
         // Partial contract: no strike, no right → contract_details returns every
         // listed option (both rights, all strikes) for this symbol + expiry.
+        //
+        // Multiplier is intentionally left unset here: unlike option_snapshot,
+        // which resolves ONE specific contract and assumes the standard 100
+        // multiplier (see DEFAULT_OPTION_MULTIPLIER), strike enumeration wants
+        // every listed strike. Pinning multiplier to "100" would silently drop
+        // any non-standard-multiplier listings (e.g. 50/1000 index options,
+        // post-split contracts); omitting it lets contract_details return them
+        // all, and distinct_sorted_strikes dedups across multipliers.
         let contract = Contract {
             symbol: symbol.into(),
             security_type: SecurityType::Option,
             exchange: exchange.into(),
             currency: "USD".into(),
             last_trade_date_or_contract_month: expiry_str.clone(),
-            multiplier: "100".into(),
             ..Default::default()
         };
 
         // Same exchange-fallback discipline as option_snapshot.
-        let exchanges_to_try = if exchange.is_empty() || exchange == "SMART" {
-            vec![exchange.to_string()]
-        } else {
-            vec![exchange.to_string(), String::new()]
-        };
-
-        let mut last_err = None;
-        for ex in &exchanges_to_try {
-            let mut c = contract.clone();
-            c.exchange = ex.as_str().into();
-            match self.cached_contract_details(&c).await {
-                Ok(d) if !d.is_empty() => {
-                    return Ok(distinct_sorted_strikes(d.iter().map(|cd| cd.contract.strike)));
-                }
-                Ok(_) => {
-                    last_err = Some(IbError::ContractResolution(format!(
-                        "contract_details returned no strikes for {symbol} {expiry_str} on {ex}"
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "strikes-for-expiry contract_details failed for {symbol} {expiry_str} on {ex}: {e}"
-                    );
-                    last_err = Some(IbError::from(e));
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            IbError::ContractResolution(format!("no strikes for {symbol} {expiry_str}"))
-        }))
+        let details = self
+            .resolve_contract_with_exchange_fallback(
+                &contract,
+                exchange,
+                &format!("{symbol} {expiry_str}"),
+            )
+            .await?;
+        Ok(distinct_sorted_strikes(
+            details.iter().map(|cd| cd.contract.strike),
+        ))
     }
 
     /// Get a market data snapshot for an option using an already-resolved
