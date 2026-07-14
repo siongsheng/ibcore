@@ -611,14 +611,69 @@ mod tests {
     }
 
     #[test]
-    fn classify_inactive_maps_to_rejected() {
+    fn classify_inactive_maps_to_inactive() {
+        // Issue #13: IB `Inactive` is neither a hard rejection nor an explicit
+        // cancel, so it maps to its own terminal variant rather than Rejected.
         let ev = OrderStatusEvent::Inactive { order_id: 10 };
         match classify_terminal(ev) {
-            Some(OrderOutcome::Rejected { order_id, reason }) => {
+            Some(OrderOutcome::Inactive { order_id, reason }) => {
                 assert_eq!(order_id, 10);
                 assert!(reason.contains("inactive"));
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Inactive, got {other:?}"),
+        }
+    }
+
+    // ── order_rejected_from (issue #14) ──
+
+    #[test]
+    fn order_rejected_from_notice_preserves_code_and_json() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 201,
+            message: "Order rejected - insufficient margin".into(),
+            error_time: None,
+            advanced_order_reject_json: "{\"orderId\":5}".into(),
+        });
+        match order_rejected_from("submit_order failed", &err) {
+            IbError::OrderRejected { code, message, rejection_json } => {
+                assert_eq!(code, 201);
+                assert!(message.starts_with("submit_order failed:"));
+                assert!(message.contains("insufficient margin"));
+                assert_eq!(rejection_json.as_deref(), Some("{\"orderId\":5}"));
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_rejected_from_notice_empty_json_is_none() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 321,
+            message: "Error validating request".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_rejected_from("submit_order failed", &err) {
+            IbError::OrderRejected { code, rejection_json, .. } => {
+                assert_eq!(code, 321);
+                assert!(rejection_json.is_none());
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_rejected_from_non_notice_falls_back_to_zero() {
+        // Connection / IO / shutdown errors carry no IB code — code 0, but the
+        // original error is preserved in the message for diagnosis.
+        let err = ibapi::Error::ConnectionFailed;
+        match order_rejected_from("place_order failed", &err) {
+            IbError::OrderRejected { code, message, rejection_json } => {
+                assert_eq!(code, 0);
+                assert!(message.starts_with("place_order failed:"));
+                assert!(rejection_json.is_none());
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
         }
     }
 
