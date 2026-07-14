@@ -22,7 +22,12 @@ use std::fmt;
 /// | `Timeout`           | IO timed out               |
 /// | `ContractResolution`| (derived from API calls)   |
 /// | `Other`             | everything else             |
+///
+/// `#[non_exhaustive]`: IB's error space grows over time, so new variants must
+/// stay additive for downstream consumers (same policy as
+/// [`crate::OrderOutcome`]).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IbError {
     /// Connection could not be established or was lost.
     ConnectionFailed(String),

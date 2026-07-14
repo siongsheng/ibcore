@@ -312,6 +312,18 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 reason: String::new(),
                 status,
             },
+            // ibcore::OrderStatusEvent is #[non_exhaustive]; surface any future
+            // variant as a generic "Unknown" kind rather than failing to build.
+            _ => PyOrderStatusEvent {
+                kind: "Unknown".into(),
+                order_id: 0,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: None,
+                execution_id: None,
+                reason: String::new(),
+                status: String::new(),
+            },
         }
     }
 }
@@ -498,6 +510,9 @@ pub fn ib_err_to_py_err(e: &ibcore::IbError) -> PyErr {
         ibcore::IbError::Other(msg) => {
             PyErr::new::<PyIbError, _>((None::<i32>, msg.clone()))
         }
+        // ibcore::IbError is #[non_exhaustive]; map any future variant to the
+        // base IbError exception using its Display, rather than failing to build.
+        _ => PyErr::new::<PyIbError, _>((None::<i32>, e.to_string())),
     }
 }
 
