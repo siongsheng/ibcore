@@ -586,6 +586,69 @@ impl IbClient {
             .await
     }
 
+    /// Enumerate the strikes that actually TRADE for a specific expiry, via
+    /// `contract_details` on a partial option contract (symbol + expiry, no
+    /// strike/right).
+    ///
+    /// `fetch_option_chain` (secDefOptParams) returns the UNION of strikes
+    /// across ALL expirations, so a strike in that list may not be listed for a
+    /// given expiry (e.g. weekly $1 strikes vs a monthly's $5 grid) — resolving
+    /// it fails with `[200] No security definition`. This returns only the
+    /// strikes valid for `expiry_ymd`, so callers pick a resolvable strike on
+    /// the first try instead of walking adjacents (#45).
+    pub async fn option_strikes_for_expiry(
+        &self,
+        symbol: &str,
+        expiry_ymd: (u16, u8, u8),
+        exchange: &str,
+    ) -> Result<Vec<f64>, IbError> {
+        let (year, month, day) = expiry_ymd;
+        let expiry_str = format!("{year:04}{month:02}{day:02}");
+        // Partial contract: no strike, no right → contract_details returns every
+        // listed option (both rights, all strikes) for this symbol + expiry.
+        let contract = Contract {
+            symbol: symbol.into(),
+            security_type: SecurityType::Option,
+            exchange: exchange.into(),
+            currency: "USD".into(),
+            last_trade_date_or_contract_month: expiry_str.clone(),
+            multiplier: "100".into(),
+            ..Default::default()
+        };
+
+        // Same exchange-fallback discipline as option_snapshot.
+        let exchanges_to_try = if exchange.is_empty() || exchange == "SMART" {
+            vec![exchange.to_string()]
+        } else {
+            vec![exchange.to_string(), String::new()]
+        };
+
+        let mut last_err = None;
+        for ex in &exchanges_to_try {
+            let mut c = contract.clone();
+            c.exchange = ex.as_str().into();
+            match self.cached_contract_details(&c).await {
+                Ok(d) if !d.is_empty() => {
+                    return Ok(distinct_sorted_strikes(d.iter().map(|cd| cd.contract.strike)));
+                }
+                Ok(_) => {
+                    last_err = Some(IbError::ContractResolution(format!(
+                        "contract_details returned no strikes for {symbol} {expiry_str} on {ex}"
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "strikes-for-expiry contract_details failed for {symbol} {expiry_str} on {ex}: {e}"
+                    );
+                    last_err = Some(IbError::from(e));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            IbError::ContractResolution(format!("no strikes for {symbol} {expiry_str}"))
+        }))
+    }
+
     /// Get a market data snapshot for an option using an already-resolved
     /// IB contract.
     ///
@@ -997,9 +1060,31 @@ async fn collect_option_snapshot_ticks(
         .unwrap_or_default()
 }
 
+/// Distinct, ascending, positive strikes from raw `contract_details` strike
+/// values. Pure — sorts, drops non-positive sentinels, and dedups; unit-tested
+/// independently of any IB round-trip. Used by [`IbClient::option_strikes_for_expiry`].
+fn distinct_sorted_strikes(strikes: impl Iterator<Item = f64>) -> Vec<f64> {
+    let mut v: Vec<f64> = strikes.filter(|s| *s > 0.0).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.dedup();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_sorted_strikes_sorts_dedups_and_drops_sentinels() {
+        let got = distinct_sorted_strikes([790.0, 785.0, 790.0, 0.0, -1.0, 795.0].into_iter());
+        assert_eq!(got, vec![785.0, 790.0, 795.0]);
+    }
+
+    #[test]
+    fn distinct_sorted_strikes_empty_is_empty() {
+        let got = distinct_sorted_strikes(std::iter::empty());
+        assert!(got.is_empty());
+    }
 
     /// Compile-time check: this won't compile until tick_stream() exists on IbClient.
     /// The inner function references the method by name; if it's missing, rustc fails.
