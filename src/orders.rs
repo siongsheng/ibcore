@@ -888,6 +888,94 @@ mod tests {
         assert_eq!(event, OrderStatusEvent::Inactive { order_id: 5 });
     }
 
+    // ── map_order_update tests (issue #23) ──
+
+    #[test]
+    fn map_commission_report_to_commission_event() {
+        // #23: a CommissionReport must map to a dedicated Commission event that
+        // carries the execution_id — the only key that links it to a fill.
+        let update = ibapi::orders::OrderUpdate::CommissionReport(
+            ibapi::orders::CommissionReport {
+                execution_id: "exec-1".into(),
+                commission: 1.25,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            map_order_update(&update),
+            Some(OrderStatusEvent::Commission {
+                execution_id: "exec-1".to_string(),
+                commission: 1.25,
+            })
+        );
+    }
+
+    #[test]
+    fn map_commission_report_is_not_fake_filled() {
+        // #23: the old behavior emitted a fake Filled{order_id:0} for commission
+        // reports, which was unattributable. It must no longer be a Filled.
+        let update = ibapi::orders::OrderUpdate::CommissionReport(
+            ibapi::orders::CommissionReport {
+                execution_id: "exec-9".into(),
+                commission: 0.75,
+                ..Default::default()
+            },
+        );
+        let ev = map_order_update(&update).expect("commission report must map to an event");
+        assert!(
+            !matches!(ev, OrderStatusEvent::Filled { .. }),
+            "commission report must not be a Filled event, got {ev:?}"
+        );
+    }
+
+    #[test]
+    fn map_execution_data_to_execution_event() {
+        // #23: ExecutionData must be surfaced (not dropped) so the execution_id
+        // ↔ order_id link is available to join against Commission.
+        let update = ibapi::orders::OrderUpdate::ExecutionData(
+            ibapi::orders::ExecutionData {
+                execution: ibapi::orders::Execution {
+                    order_id: 77,
+                    execution_id: "exec-1".into(),
+                    shares: 10.0,
+                    price: 6.50,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            map_order_update(&update),
+            Some(OrderStatusEvent::Execution {
+                order_id: 77,
+                execution_id: "exec-1".to_string(),
+                shares: 10.0,
+                price: 6.50,
+            })
+        );
+    }
+
+    #[test]
+    fn map_order_status_update_still_maps_to_typed_event() {
+        let update = ibapi::orders::OrderUpdate::OrderStatus(ibapi::orders::OrderStatus {
+            order_id: 3,
+            status: OrderStatusKind::Submitted,
+            filled: 0.0,
+            remaining: 100.0,
+            average_fill_price: None,
+            perm_id: 0,
+            parent_id: 0,
+            last_fill_price: None,
+            client_id: 0,
+            why_held: String::new(),
+            market_cap_price: None,
+        });
+        assert_eq!(
+            map_order_update(&update),
+            Some(OrderStatusEvent::Submitted { order_id: 3 })
+        );
+    }
+
     #[test]
     fn order_status_stream_construct() {
         // Verify OrderStatusStream can be constructed (compile-time check)

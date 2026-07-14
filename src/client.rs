@@ -1465,6 +1465,76 @@ mod tests {
         assert_eq!(snap.option_delta, 0.0);
     }
 
+    // ── option-snapshot completeness (issue #24) ──
+
+    #[test]
+    fn option_snapshot_complete_requires_price_and_greeks() {
+        // Greeks only, no price — NOT complete (the #24 bug used to break here).
+        let greeks_only = OptionSnapshot {
+            option_iv: 0.25,
+            option_delta: 0.30,
+            ..Default::default()
+        };
+        assert!(!option_snapshot_complete(&greeks_only), "greeks without a price is incomplete");
+
+        // Price only, no greeks — NOT complete.
+        let price_only = OptionSnapshot { bid: 5.0, ask: 5.5, ..Default::default() };
+        assert!(!option_snapshot_complete(&price_only), "price without greeks is incomplete");
+
+        // Both a usable price and greeks — complete.
+        let both = OptionSnapshot {
+            bid: 5.0,
+            ask: 5.5,
+            option_delta: 0.30,
+            ..Default::default()
+        };
+        assert!(option_snapshot_complete(&both), "price + greeks is complete");
+    }
+
+    #[test]
+    fn option_snapshot_zero_priced_aligns_with_completeness() {
+        // #24: the retry/validity gate must use the same definition as the
+        // early-break — an incomplete snapshot counts as "needs retry".
+        let greeks_only = OptionSnapshot { option_delta: 0.30, ..Default::default() };
+        assert!(greeks_only.is_zero_priced(), "greeks-only must be treated as needing retry");
+
+        let complete = OptionSnapshot { bid: 5.0, option_delta: 0.30, ..Default::default() };
+        assert!(!complete.is_zero_priced(), "a complete snapshot must not trigger retry");
+    }
+
+    /// #24: greeks arrive BEFORE any price tick. The collector must not break
+    /// early and return a zero-priced snapshot — it must wait for the price.
+    #[tokio::test]
+    async fn collect_option_snapshot_waits_for_price_when_greeks_arrive_first() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.5,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_option_snapshot_ticks(stream).await;
+        assert!(
+            snap.bid > 0.0 || snap.ask > 0.0,
+            "collector must wait for a price tick, got bid={} ask={}",
+            snap.bid,
+            snap.ask
+        );
+        assert!(snap.option_delta != 0.0, "greeks must still be present");
+    }
+
     // ── remote diagnostics tests ──
 
     #[cfg(feature = "remote-diagnostics")]
