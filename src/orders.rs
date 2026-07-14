@@ -105,6 +105,37 @@ pub enum OrderStatusEvent {
         /// Raw status string from IB.
         status: String,
     },
+    /// A fill execution report (from ibapi [`ExecutionData`](ibapi::orders::ExecutionData)).
+    ///
+    /// Carries the `order_id` alongside the raw `execution_id`. Because an
+    /// [`Execution`](ibapi::orders::Execution) always has both, this is the
+    /// bridge that lets a consumer join a [`Commission`](Self::Commission)
+    /// (which has only an `execution_id`) back to the order that generated it
+    /// (#23). The `execution_id` is a raw non-empty `String` — the variant only
+    /// exists when IB delivered an execution, which always carries an id.
+    Execution {
+        /// The API-assigned order ID.
+        order_id: i32,
+        /// IB execution identifier (each partial fill has a distinct id).
+        execution_id: String,
+        /// Number of shares/contracts filled by this execution.
+        shares: f64,
+        /// Execution price, excluding commission.
+        price: f64,
+    },
+    /// A commission report (from ibapi [`CommissionReport`](ibapi::orders::CommissionReport)).
+    ///
+    /// IB delivers commissions on a separate message that carries **only** an
+    /// `execution_id` — never an `order_id`. Join this to an
+    /// [`Execution`](Self::Execution) with the same `execution_id` to attribute
+    /// the commission to an order (#23). The `execution_id` is a raw `String`
+    /// (a commission report always references an execution).
+    Commission {
+        /// IB execution identifier this commission belongs to.
+        execution_id: String,
+        /// Commission cost for the execution.
+        commission: f64,
+    },
 }
 
 /// Terminal outcome of an order placed via [`IbClient::place_order_await`].
@@ -191,28 +222,49 @@ impl OrderStatusStream {
     pub async fn next(&mut self) -> Option<Result<OrderStatusEvent, IbError>> {
         loop {
             match self.inner.next().await {
-                Some(Ok(ibapi::orders::OrderUpdate::OrderStatus(status))) => {
-                    return Some(Ok(map_order_status(&status)));
-                }
-                Some(Ok(ibapi::orders::OrderUpdate::CommissionReport(report))) => {
-                    // Commission reports are handled as part of Filled events.
-                    // We emit them as separate events for consumers that want them.
-                    return Some(Ok(OrderStatusEvent::Filled {
-                        order_id: 0, // Not available in commission report; caller matches via execution_id
-                        filled_qty: 0.0,
-                        avg_price: 0.0,
-                        commission: Some(report.commission),
-                        execution_id: normalize_execution_id(report.execution_id),
-                    }));
-                }
-                Some(Ok(_)) => {
-                    // OpenOrder / ExecutionData — skip, handled elsewhere
-                    continue;
-                }
+                Some(Ok(update)) => match map_order_update(&update) {
+                    Some(ev) => return Some(Ok(ev)),
+                    // OpenOrder — delivered via `open_orders()`, skip here.
+                    None => continue,
+                },
                 Some(Err(e)) => return Some(Err(IbError::from(e))),
                 None => return None,
             }
         }
+    }
+}
+
+/// Map an ibapi [`OrderUpdate`](ibapi::orders::OrderUpdate) into our typed
+/// [`OrderStatusEvent`].
+///
+/// Returns `None` for updates this stream does not surface (`OpenOrder`, which
+/// is served by [`IbClient::open_orders`] instead). Pure — the async `next`
+/// loop is a thin wrapper that skips `None`, which keeps the mapping unit-testable
+/// (`ExecutionData`/`CommissionReport` aren't practically deliverable through a
+/// live subscription in a unit test, but they derive `Default` so they can be
+/// constructed and fed to this helper directly).
+///
+/// A `CommissionReport` maps to [`OrderStatusEvent::Commission`] (NOT a fake
+/// `Filled{order_id:0}`) and an `ExecutionData` to [`OrderStatusEvent::Execution`],
+/// so a consumer can join `Execution.execution_id` ↔ `Commission.execution_id`
+/// ↔ `order_id` and attribute a commission to its order (#23). The new variants
+/// carry the raw `execution_id` String since they only exist when IB supplied one.
+fn map_order_update(update: &ibapi::orders::OrderUpdate) -> Option<OrderStatusEvent> {
+    use ibapi::orders::OrderUpdate;
+    match update {
+        OrderUpdate::OrderStatus(status) => Some(map_order_status(status)),
+        OrderUpdate::ExecutionData(data) => Some(OrderStatusEvent::Execution {
+            order_id: data.execution.order_id,
+            execution_id: data.execution.execution_id.clone(),
+            shares: data.execution.shares,
+            price: data.execution.price,
+        }),
+        OrderUpdate::CommissionReport(report) => Some(OrderStatusEvent::Commission {
+            execution_id: report.execution_id.clone(),
+            commission: report.commission,
+        }),
+        // OpenOrder is a one-shot snapshot concern, not a status event.
+        OrderUpdate::OpenOrder(_) => None,
     }
 }
 
@@ -274,7 +326,13 @@ fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
         OrderStatusEvent::Inactive { order_id } => {
             Some(OrderOutcome::Inactive { order_id, reason: "order went inactive".to_string() })
         }
-        OrderStatusEvent::Submitted { .. } | OrderStatusEvent::Other { .. } => None,
+        // Non-terminal for order-await purposes: acks, generic updates, and the
+        // execution/commission bookkeeping events (#23) — none of which conclude
+        // the order on their own; a terminal OrderStatus still arrives.
+        OrderStatusEvent::Submitted { .. }
+        | OrderStatusEvent::Other { .. }
+        | OrderStatusEvent::Execution { .. }
+        | OrderStatusEvent::Commission { .. } => None,
     }
 }
 
@@ -312,6 +370,13 @@ fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
 /// Normalize an IB execution ID string: empty strings are coerced to `None`,
 /// preserving non-empty values. This prevents `Some("")` which would force
 /// every consumer to check for empty strings.
+///
+/// Retained as the canonical rule for the `Option<String>` `execution_id` on
+/// [`OrderStatusEvent::Filled`]. After #23, commission/execution ids flow
+/// through the dedicated [`OrderStatusEvent::Commission`]/[`Execution`](OrderStatusEvent::Execution)
+/// variants (which carry a raw, always-present `String`), so no production path
+/// currently calls this — `allow(dead_code)` keeps the contract and its tests.
+#[allow(dead_code)]
 fn normalize_execution_id(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
