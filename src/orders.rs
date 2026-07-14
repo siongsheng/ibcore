@@ -933,4 +933,55 @@ mod tests {
         assert!(o.limit_price.is_none());
         assert_eq!(o.filled_qty, o.quantity);
     }
+
+    // ── outcome_for_stream_error tests (#20) ──
+    //
+    // The place_order subscription multiplexes genuine broker rejections with
+    // transport failures. Only a proven OrderRejected may become Rejected; a
+    // connection-dead (or otherwise unprovable) error must stay Pending so the
+    // caller reconciles via order status instead of wrongly bailing/re-submitting.
+
+    #[test]
+    fn stream_error_order_rejected_maps_to_rejected() {
+        let err = IbError::OrderRejected {
+            code: 201,
+            message: "insufficient funds".into(),
+            rejection_json: None,
+        };
+        match outcome_for_stream_error(&err, 42) {
+            OrderOutcome::Rejected { order_id, reason } => {
+                assert_eq!(order_id, 42);
+                assert!(reason.contains("insufficient funds"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_connection_reset_maps_to_pending() {
+        match outcome_for_stream_error(&IbError::ConnectionReset, 7) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 7),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_connection_failed_maps_to_pending() {
+        let err = IbError::ConnectionFailed("mid-flight drop".into());
+        match outcome_for_stream_error(&err, 9) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 9),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_other_maps_to_pending() {
+        // Anything not provably a rejection stays Pending — never claim a
+        // rejection we can't prove.
+        let err = IbError::Other("unexpected".into());
+        match outcome_for_stream_error(&err, 3) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 3),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
 }
