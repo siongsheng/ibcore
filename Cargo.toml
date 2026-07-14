@@ -1,6 +1,6 @@
 [package]
 name = "ibcore"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Standalone IB Gateway integration layer wrapping ibapi — diagnostic events, structured errors, market data snapshots"
 readme = "README.md"
