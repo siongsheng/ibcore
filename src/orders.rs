@@ -1264,4 +1264,41 @@ mod tests {
         );
         assert!(crate::is_connection_dead(&e), "502 at submit must be connection-dead: {e:?}");
     }
+
+    #[test]
+    fn order_submit_error_notice_110_is_order_rejected() {
+        // #32 review: an out-of-range broker rejection (110 "price does not
+        // conform to the minimum price variation") is still a genuine rejection
+        // — it must be OrderRejected preserving its real code, NOT flattened to
+        // IbError::Other.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 110,
+            message: "The price does not conform to the minimum price variation".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, message, .. } => {
+                assert_eq!(code, 110);
+                assert!(message.contains("submit_order failed"), "context lost: {message}");
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_submit_error_notice_434_is_order_rejected() {
+        // 434 "order size cannot be zero" — another out-of-range broker
+        // rejection that must stay OrderRejected.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 434,
+            message: "The order size cannot be zero".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, .. } => assert_eq!(code, 434),
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
 }
