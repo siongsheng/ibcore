@@ -367,6 +367,40 @@ fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
     }
 }
 
+/// Classify an order submit/cancel failure with the same philosophy as the
+/// stream path (#20, #32 R2).
+///
+/// [`place_order`](IbClient::place_order), the initial `place_order` in
+/// [`place_order_await`](IbClient::place_order_await), and
+/// [`cancel_order`](IbClient::cancel_order) previously routed EVERY failure
+/// through [`order_rejected_from`], which always yields
+/// [`IbError::OrderRejected`] — even for a mid-flight connection drop. That
+/// misclassifies a transport failure as a broker rejection: the order may still
+/// be live/filling at IB, so the caller must reconcile rather than assume it
+/// died.
+///
+/// Only a GENUINE broker rejection — a [`Notice`](ibapi::Notice) whose code is
+/// in the order-rejection range (200–299) — becomes [`IbError::OrderRejected`].
+/// Everything else (connection / IO / shutdown, or an out-of-range Notice such
+/// as a 502 raised while submitting) is classified via
+/// [`IbError::from`], which produces the connection-dead variant that
+/// [`crate::is_connection_dead`] recognises. The call-site `context` is
+/// preserved in the resulting message via
+/// [`with_context`](crate::errors::with_context) so diagnosis isn't lost.
+fn order_submit_error(context: &str, err: ibapi::Error) -> IbError {
+    // A genuine broker rejection is a Notice in the 200–299 range — that is the
+    // ONLY case that proves the order will not work, so it maps to OrderRejected
+    // (via order_rejected_from, which already prefixes context).
+    if let ibapi::Error::Notice(notice) = &err
+        && (200..=299).contains(&notice.code)
+    {
+        return order_rejected_from(context, &err);
+    }
+    // Otherwise reclassify (connection / IO / shutdown / out-of-range Notice),
+    // preserving the call-site context in the surfaced message.
+    crate::errors::with_context(context, IbError::from(err))
+}
+
 /// Classify a stream error from [`IbClient::place_order_await`]'s subscription
 /// into an [`OrderOutcome`] (#20).
 ///
@@ -433,12 +467,12 @@ impl IbClient {
             .inner()
             .next_valid_order_id()
             .await
-            .map_err(|e| order_rejected_from("failed to get order ID", &e))?;
+            .map_err(|e| order_submit_error("failed to get order ID", e))?;
 
         self.inner()
             .submit_order(order_id, contract, order)
             .await
-            .map_err(|e| order_rejected_from("submit_order failed", &e))?;
+            .map_err(|e| order_submit_error("submit_order failed", e))?;
 
         Ok(order_id)
     }
@@ -472,7 +506,7 @@ impl IbClient {
             .inner()
             .place_order(order_id, contract, order)
             .await
-            .map_err(|e| order_rejected_from("place_order failed", &e))?;
+            .map_err(|e| order_submit_error("place_order failed", e))?;
 
         let outcome = tokio::time::timeout(timeout, async {
             let mut data = sub.filter_data();
@@ -512,7 +546,7 @@ impl IbClient {
             .inner()
             .cancel_order(order_id, "")
             .await
-            .map_err(|e| order_rejected_from("cancel_order failed", &e))?;
+            .map_err(|e| order_submit_error("cancel_order failed", e))?;
         Ok(())
     }
 
