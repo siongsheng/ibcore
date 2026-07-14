@@ -1169,4 +1169,65 @@ mod tests {
             other => panic!("expected Pending, got {other:?}"),
         }
     }
+
+    // ── order_submit_error tests (#32 R2) ──
+    //
+    // Submit/cancel failures must be classified with the SAME philosophy as the
+    // stream path (#20): only a proven broker-rejection Notice (200–299) is a
+    // genuine OrderRejected; a connection drop / IO / shutdown / out-of-range
+    // Notice must classify to a connection-dead variant so `is_connection_dead`
+    // is true and the caller reconciles instead of assuming the order died.
+
+    #[test]
+    fn order_submit_error_notice_201_is_order_rejected() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 201,
+            message: "insufficient margin".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, message, .. } => {
+                assert_eq!(code, 201);
+                assert!(message.contains("submit_order failed"), "context lost: {message}");
+                assert!(message.contains("insufficient margin"));
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_submit_error_connection_reset_is_connection_dead_not_rejected() {
+        let e = order_submit_error("place_order failed", ibapi::Error::ConnectionReset);
+        assert!(
+            matches!(e, IbError::ConnectionReset),
+            "connection reset must NOT become OrderRejected, got {e:?}"
+        );
+        assert!(crate::is_connection_dead(&e));
+    }
+
+    #[test]
+    fn order_submit_error_connection_failed_is_connection_dead() {
+        let e = order_submit_error("place_order failed", ibapi::Error::ConnectionFailed);
+        assert!(matches!(e, IbError::ConnectionFailed(_)), "got {e:?}");
+        assert!(crate::is_connection_dead(&e));
+    }
+
+    #[test]
+    fn order_submit_error_notice_502_is_connection_dead_not_rejected() {
+        // A 502 raised while submitting is a connection-level error, NOT a
+        // broker rejection — it must not surface as OrderRejected.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 502,
+            message: "Couldn't connect to TWS".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        let e = order_submit_error("submit_order failed", err);
+        assert!(
+            !matches!(e, IbError::OrderRejected { .. }),
+            "a 502 at submit must not be OrderRejected, got {e:?}"
+        );
+        assert!(crate::is_connection_dead(&e), "502 at submit must be connection-dead: {e:?}");
+    }
 }
