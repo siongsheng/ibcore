@@ -309,6 +309,35 @@ fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
     }
 }
 
+/// Classify a stream error from [`IbClient::place_order_await`]'s subscription
+/// into an [`OrderOutcome`] (#20).
+///
+/// The `place_order` subscription multiplexes BOTH genuine broker rejections
+/// and transport failures. A mid-flight connection drop
+/// ([`IbError::ConnectionReset`] / [`IbError::ConnectionFailed`], derived from
+/// ibapi's `ConnectionReset` / `Shutdown` / `Io`) must NOT be reported as
+/// [`OrderOutcome::Rejected`]: the order may still be live/filling at IB, so the
+/// caller would wrongly bail or re-submit. Only a proven broker rejection
+/// ([`IbError::OrderRejected`], a Notice in 200–299) maps to `Rejected`.
+/// Everything else — connection-dead or otherwise unprovable — maps to
+/// [`OrderOutcome::Pending`], so we never claim a rejection we cannot prove; the
+/// caller reconciles via the order-status stream.
+///
+/// Pure function so the classification is unit-testable without a live IB
+/// Gateway. `OrderRejected` is the only case that proves the order will not
+/// work, so the default arm safely covers connection-dead errors (checking
+/// [`crate::is_connection_dead`] first would be redundant — it too returns
+/// `Pending`).
+fn outcome_for_stream_error(err: &IbError, order_id: i32) -> OrderOutcome {
+    match err {
+        IbError::OrderRejected { .. } => OrderOutcome::Rejected {
+            order_id,
+            reason: err.to_string(),
+        },
+        _ => OrderOutcome::Pending { order_id },
+    }
+}
+
 /// Normalize an IB execution ID string: empty strings are coerced to `None`,
 /// preserving non-empty values. This prevents `Some("")` which would force
 /// every consumer to check for empty strings.
@@ -392,9 +421,12 @@ impl IbClient {
                     }
                     // OpenOrder / ExecutionData / CommissionReport — not terminal here.
                     Ok(_) => continue,
-                    // IB delivers order rejections as an error on this subscription.
+                    // This subscription multiplexes genuine order rejections
+                    // with transport failures — classify before deciding, so a
+                    // mid-flight disconnect stays Pending rather than a false
+                    // Rejected (#20).
                     Err(e) => {
-                        return OrderOutcome::Rejected { order_id, reason: e.to_string() };
+                        return outcome_for_stream_error(&IbError::from(e), order_id);
                     }
                 }
             }
@@ -932,5 +964,56 @@ mod tests {
         };
         assert!(o.limit_price.is_none());
         assert_eq!(o.filled_qty, o.quantity);
+    }
+
+    // ── outcome_for_stream_error tests (#20) ──
+    //
+    // The place_order subscription multiplexes genuine broker rejections with
+    // transport failures. Only a proven OrderRejected may become Rejected; a
+    // connection-dead (or otherwise unprovable) error must stay Pending so the
+    // caller reconciles via order status instead of wrongly bailing/re-submitting.
+
+    #[test]
+    fn stream_error_order_rejected_maps_to_rejected() {
+        let err = IbError::OrderRejected {
+            code: 201,
+            message: "insufficient funds".into(),
+            rejection_json: None,
+        };
+        match outcome_for_stream_error(&err, 42) {
+            OrderOutcome::Rejected { order_id, reason } => {
+                assert_eq!(order_id, 42);
+                assert!(reason.contains("insufficient funds"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_connection_reset_maps_to_pending() {
+        match outcome_for_stream_error(&IbError::ConnectionReset, 7) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 7),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_connection_failed_maps_to_pending() {
+        let err = IbError::ConnectionFailed("mid-flight drop".into());
+        match outcome_for_stream_error(&err, 9) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 9),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_other_maps_to_pending() {
+        // Anything not provably a rejection stays Pending — never claim a
+        // rejection we can't prove.
+        let err = IbError::Other("unexpected".into());
+        match outcome_for_stream_error(&err, 3) {
+            OrderOutcome::Pending { order_id } => assert_eq!(order_id, 3),
+            other => panic!("expected Pending, got {other:?}"),
+        }
     }
 }
