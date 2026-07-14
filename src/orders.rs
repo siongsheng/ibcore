@@ -627,6 +627,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_filled_without_price_is_not_terminal() {
+        // Issue #22: IB can send a Filled status before average_fill_price is
+        // populated (arrives as None → 0.0). Booking a $0 fill corrupts P&L, so
+        // a priceless Filled is treated as non-terminal — keep waiting for the
+        // status that carries the real average price.
+        let ev = OrderStatusEvent::Filled {
+            order_id: 7,
+            filled_qty: 1.0,
+            avg_price: 0.0,
+            commission: None,
+            execution_id: None,
+        };
+        assert!(classify_terminal(ev).is_none(), "priceless fill must not be terminal");
+    }
+
+    #[test]
     fn classify_rejected_is_terminal_with_reason() {
         let ev = OrderStatusEvent::Rejected { order_id: 8, reason: "no security def".into() };
         match classify_terminal(ev) {
