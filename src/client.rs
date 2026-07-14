@@ -150,6 +150,22 @@ fn collection_result<T>(
     Ok(items)
 }
 
+/// Extract NetLiquidation from an account-summary result (#27).
+///
+/// Pure so the phantom-zero guard is unit-testable without a live gateway:
+/// a present-but-unparseable value is an [`Err`] (not `Ok(0.0)`), an absent tag
+/// is an [`Err`], and only a real numeric value is [`Ok`].
+fn parse_net_liquidation(summary: &[(String, String, String, String)]) -> Result<f64, IbError> {
+    for (_account, tag, value, _currency) in summary {
+        if tag == "NetLiquidation" {
+            return value.parse::<f64>().map_err(|_| {
+                IbError::Other(format!("NetLiquidation unparseable: {value:?}"))
+            });
+        }
+    }
+    Err(IbError::Other("NetLiquidation not returned".into()))
+}
+
 impl IbClient {
     /// Access the underlying ibapi Client (cloning gives another `Arc` handle).
     pub fn inner(&self) -> Arc<ibapi::Client> {
@@ -577,7 +593,10 @@ impl IbClient {
     /// Get a market data snapshot for a stock or index.
     ///
     /// Retries up to 3 times with exponential backoff when the snapshot returns
-    /// all-zero bid/ask/last prices (competing live session blocking paper data).
+    /// all-zero prices. On exhaustion returns [`IbError::CompetingSession`] only
+    /// when ticks arrived but were all zero (the 10197 signature),
+    /// [`IbError::Timeout`] when no ticks arrived at all, or the underlying
+    /// stream error if one was recorded (#27).
     pub async fn stock_snapshot(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
         retry_market_data(
             || self.stock_snapshot_inner(symbol),
@@ -592,13 +611,13 @@ impl IbClient {
     /// API, which returns 10197 on Gateway 10.45+.
     /// See https://github.com/wboayue/rust-ibapi/issues/683
     ///
-    /// Returns `(snapshot, saw_tick)`: `saw_tick` is true if ANY market-data
-    /// tick arrived, so [`retry_market_data`] can tell a plain timeout (no
-    /// ticks) from the competing-session signature (ticks arrived, all zero).
+    /// Returns a [`SnapshotAttempt`] so [`retry_market_data`] can tell a plain
+    /// timeout (no ticks) from the competing-session signature (ticks arrived,
+    /// all zero) and can surface a recorded stream error.
     async fn stock_snapshot_inner(
         &self,
         symbol: &str,
-    ) -> Result<(StockSnapshot, bool), IbError> {
+    ) -> Result<SnapshotAttempt<StockSnapshot>, IbError> {
         let contract = if symbol == "VIX" {
             Contract {
                 symbol: symbol.into(),
@@ -742,8 +761,10 @@ impl IbClient {
     /// Get a market data snapshot for an option using an already-resolved
     /// IB contract.
     ///
-    /// Retries up to 3 times with exponential backoff when the snapshot returns
-    /// all-zero prices (error 10197: competing live session blocking paper data).
+    /// Retries up to 3 times with exponential backoff when the snapshot is
+    /// incomplete. On exhaustion returns [`IbError::CompetingSession`] (ticks
+    /// arrived, all zero — the 10197 signature), [`IbError::Timeout`] (no ticks),
+    /// or the underlying stream error if one was recorded (#27).
     pub async fn option_snapshot_from_contract(
         &self,
         contract: &ibapi::contracts::Contract,
@@ -757,11 +778,11 @@ impl IbClient {
     /// API, which returns 10197 on Gateway 10.45+.
     /// See https://github.com/wboayue/rust-ibapi/issues/683
     ///
-    /// Returns `(snapshot, saw_tick)` — see [`stock_snapshot_inner`](Self::stock_snapshot_inner).
+    /// Returns a [`SnapshotAttempt`] — see [`stock_snapshot_inner`](Self::stock_snapshot_inner).
     async fn snapshot_inner(
         &self,
         contract: &ibapi::contracts::Contract,
-    ) -> Result<(OptionSnapshot, bool), IbError> {
+    ) -> Result<SnapshotAttempt<OptionSnapshot>, IbError> {
         let sub = self
             .inner
             .market_data(contract)
@@ -992,18 +1013,13 @@ impl IbClient {
     }
 
     /// Fetch NetLiquidation from account summary.
+    ///
+    /// Returns `Err` (not a phantom `Ok(0.0)`) when the tag is absent from a
+    /// cleanly-completed summary OR present but unparseable, so huat never sizes
+    /// orders off a fabricated zero and instead reuses its cached net-liq (#27).
     pub async fn net_liquidation(&self, _account_id: &str) -> Result<f64, IbError> {
         let summary = self.account_summary(&["NetLiquidation"]).await?;
-        for (_account, tag, value, _currency) in summary {
-            if tag == "NetLiquidation" {
-                return Ok(value.parse().unwrap_or(0.0));
-            }
-        }
-        // The tag never arrived on a cleanly-completed summary. Returning
-        // Ok(0.0) here would let huat size orders off a phantom zero account
-        // value (#27); surface an error instead so the caller reuses its cached
-        // net-liq rather than trusting a fabricated zero.
-        Err(IbError::Other("NetLiquidation not returned".into()))
+        parse_net_liquidation(&summary)
     }
 }
 
@@ -1038,19 +1054,38 @@ const STOCK_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 /// Streaming-snapshot collection timeout for options (seconds).
 const OPTION_SNAPSHOT_TIMEOUT_SECS: u64 = 5;
 
+/// Outcome of one snapshot-collection attempt (internal).
+///
+/// Carries enough context for [`retry_market_data`] to classify a failure
+/// correctly: whether any tick arrived (timeout vs competing session, #27) and
+/// the last stream error seen (surfaced instead of a fabricated timeout, #27
+/// review FIX 2).
+struct SnapshotAttempt<T> {
+    /// Whatever data was gathered before completion/timeout.
+    snap: T,
+    /// True if ANY market-data tick arrived (even zero-priced).
+    saw_tick: bool,
+    /// The last stream error observed, if any.
+    last_error: Option<IbError>,
+}
+
 /// Decide the terminal error when a snapshot never produced usable data after
 /// all retry attempts are exhausted (#27).
 ///
-/// `saw_tick` is true if ANY market-data tick arrived across the attempts:
-/// - ticks arrived but every price was zero (`saw_tick == true`) is the genuine
+/// Precedence:
+/// - `last_error` present → surface that real stream error (never mask a genuine
+///   error with a fabricated timeout, #27 review FIX 2);
+/// - else `saw_tick` (ticks arrived but every price was zero) → the genuine
 ///   competing-session (10197) signature → [`IbError::CompetingSession`];
-/// - no ticks at all (`saw_tick == false`) is a plain market-data TIMEOUT →
-///   [`IbError::Timeout`], NOT a competing session.
+/// - else (no ticks at all) → a plain market-data TIMEOUT → [`IbError::Timeout`].
 ///
 /// Before this split, a timeout produced an all-zero snapshot indistinguishable
 /// from 10197 zeroing, so both wrongly surfaced as `CompetingSession`. Pure, so
 /// the decision is unit-testable without a live gateway.
-fn snapshot_failure_error(saw_tick: bool, timeout_secs: u64) -> IbError {
+fn snapshot_failure_error(saw_tick: bool, timeout_secs: u64, last_error: Option<IbError>) -> IbError {
+    if let Some(err) = last_error {
+        return err;
+    }
     if saw_tick {
         IbError::CompetingSession
     } else {
@@ -1066,33 +1101,45 @@ fn snapshot_failure_error(saw_tick: bool, timeout_secs: u64) -> IbError {
 /// on paper accounts when a live Gateway is also connected. Retrying with delay
 /// gives the market data stream time to recover.
 ///
-/// `fetch` yields `(snapshot, saw_tick)`; on exhaustion the terminal error is
-/// [`snapshot_failure_error`] — a plain timeout (no ticks) becomes
-/// [`IbError::Timeout`], only ticks-arrived-all-zero becomes
-/// [`IbError::CompetingSession`] (#27).
+/// `fetch` yields a [`SnapshotAttempt`]; on exhaustion the terminal error is
+/// [`snapshot_failure_error`] — a recorded stream error is surfaced, else a
+/// plain timeout (no ticks) becomes [`IbError::Timeout`] and ticks-arrived-all-
+/// zero becomes [`IbError::CompetingSession`] (#27).
+///
+/// `timeout_secs` is only for the failure message; it MUST match the collector's
+/// internal deadline constant ([`STOCK_SNAPSHOT_TIMEOUT_SECS`] /
+/// [`OPTION_SNAPSHOT_TIMEOUT_SECS`]) so the reported duration is truthful.
 async fn retry_market_data<T, F, Fut>(mut fetch: F, timeout_secs: u64) -> Result<T, IbError>
 where
     T: IsZeroPriced,
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(T, bool), IbError>>,
+    Fut: std::future::Future<Output = Result<SnapshotAttempt<T>, IbError>>,
 {
     let mut saw_tick = false;
+    let mut last_error = None;
     for attempt in 0..3 {
-        let (snap, attempt_saw_tick) = fetch().await?;
-        if !snap.is_zero_priced() {
-            return Ok(snap);
+        let a = fetch().await?;
+        if !a.snap.is_zero_priced() {
+            return Ok(a.snap);
         }
-        saw_tick |= attempt_saw_tick;
+        saw_tick |= a.saw_tick;
+        // Keep the most recent stream error so a persistent failure surfaces the
+        // real cause rather than a fabricated "no ticks" timeout (#27 FIX 2).
+        if a.last_error.is_some() {
+            last_error = a.last_error;
+        }
         let delay_ms = 1000 * (1 << attempt);
         tracing::warn!(
             "empty market data (attempt {}/3, saw_tick={}) — retrying in {}s",
             attempt + 1,
-            attempt_saw_tick,
+            a.saw_tick,
             delay_ms / 1000,
         );
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
-    if saw_tick {
+    if let Some(ref err) = last_error {
+        tracing::error!("market data failed with a stream error after 3 retries: {err}");
+    } else if saw_tick {
         tracing::error!(
             "market data persistently zero-priced after 3 retries — \
              competing live session likely blocking paper data. \
@@ -1104,14 +1151,14 @@ where
              across 3 retries — data farm may be down or the symbol not subscribed."
         );
     }
-    Err(snapshot_failure_error(saw_tick, timeout_secs))
+    Err(snapshot_failure_error(saw_tick, timeout_secs, last_error))
 }
 
 /// Retry an option snapshot — delegates to [`retry_market_data`].
 async fn retry_snapshot<F, Fut>(fetch: F) -> Result<OptionSnapshot, IbError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(OptionSnapshot, bool), IbError>>,
+    Fut: std::future::Future<Output = Result<SnapshotAttempt<OptionSnapshot>, IbError>>,
 {
     retry_market_data(fetch, OPTION_SNAPSHOT_TIMEOUT_SECS).await
 }
@@ -1144,11 +1191,24 @@ fn option_computation_rank(field: &TickType) -> Option<u8> {
 /// bid/ask/last. Fix A (internal): greeks stay `f64` — `Option<f64>` is deferred
 /// (Fix B). Kept separate from the collector so the precedence rule is
 /// unit-testable without a live gateway.
+///
+/// Placeholder guard (#27 review FIX 1): IB signals "not yet computed" greeks as
+/// `f64::MAX`, which ibapi decodes to `None`. A computation tick carrying neither
+/// IV nor delta is such a placeholder — it must NOT touch `snap` or
+/// `current_rank`, otherwise a placeholder `ModelOption` arriving first would
+/// lock rank 3 and zero the greeks (rejecting a later real bid), and a same-rank
+/// placeholder resend would zero previously-good greeks. Because a skipped
+/// placeholder never advances `current_rank`, it can neither lock out nor zero a
+/// real value.
 fn apply_option_computation(snap: &mut OptionSnapshot, current_rank: &mut u8, opt: &OptionComputation) {
     let rank = match option_computation_rank(&opt.field) {
         Some(r) => r,
         None => return,
     };
+    // Skip placeholder ticks that carry no real greeks (all-None from f64::MAX).
+    if opt.implied_volatility.is_none() && opt.delta.is_none() {
+        return;
+    }
     if rank < *current_rank {
         return;
     }
@@ -1161,17 +1221,20 @@ fn apply_option_computation(snap: &mut OptionSnapshot, current_rank: &mut u8, op
     snap.underlying_price = opt.underlying_price.unwrap_or(0.0);
 }
 
-/// Collect a stock/index snapshot from the tick stream, returning
-/// `(snapshot, saw_tick)`. `saw_tick` is true if any market-data tick arrived
-/// (even zero-priced), which lets the retry layer tell a plain timeout apart
-/// from the competing-session signature (#27). A `select!` over an explicit
-/// deadline (rather than wrapping the whole future in `timeout`) means
-/// `saw_tick` and any partial data survive even when the collection times out.
+/// Collect a stock/index snapshot from the tick stream, returning a
+/// [`SnapshotAttempt`]. `saw_tick` is true if any market-data tick arrived (even
+/// zero-priced), which lets the retry layer tell a plain timeout apart from the
+/// competing-session signature (#27); `last_error` records the most recent
+/// stream error so a persistent failure surfaces the real cause instead of a
+/// fabricated timeout (#27 review FIX 2). A `select!` over an explicit deadline
+/// (rather than wrapping the whole future in `timeout`) means these fields and
+/// any partial data survive even when the collection times out.
 async fn collect_stock_snapshot_ticks(
     mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
-) -> (StockSnapshot, bool) {
+) -> SnapshotAttempt<StockSnapshot> {
     let mut snap = StockSnapshot::default();
     let mut saw_tick = false;
+    let mut last_error = None;
     let deadline = tokio::time::sleep(Duration::from_secs(STOCK_SNAPSHOT_TIMEOUT_SECS));
     tokio::pin!(deadline);
     loop {
@@ -1198,7 +1261,12 @@ async fn collect_stock_snapshot_ticks(
                             _ => {}
                         }
                     }
-                    Some(Err(e)) => tracing::warn!("stock snapshot error: {e}"),
+                    // Record the error but keep collecting — a transient error
+                    // may be followed by good ticks that still complete the snap.
+                    Some(Err(e)) => {
+                        tracing::warn!("stock snapshot error: {e}");
+                        last_error = Some(IbError::from(e));
+                    }
                     None => break,
                 }
                 if snap.last > 0.0 || (snap.bid > 0.0 && snap.ask > 0.0) {
@@ -1207,20 +1275,21 @@ async fn collect_stock_snapshot_ticks(
             }
         }
     }
-    (snap, saw_tick)
+    SnapshotAttempt { snap, saw_tick, last_error }
 }
 
-/// Collect an option snapshot from the tick stream, returning
-/// `(snapshot, saw_tick)` (see [`collect_stock_snapshot_ticks`]).
+/// Collect an option snapshot from the tick stream, returning a
+/// [`SnapshotAttempt`] (see [`collect_stock_snapshot_ticks`]).
 ///
 /// Breaks only once the snapshot has BOTH a usable price AND greeks (#24); IB
 /// does not guarantee price ticks arrive first. Greeks are sourced with
 /// model-tick precedence via [`apply_option_computation`] (#27).
 async fn collect_option_snapshot_ticks(
     mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
-) -> (OptionSnapshot, bool) {
+) -> SnapshotAttempt<OptionSnapshot> {
     let mut snap = OptionSnapshot::default();
     let mut saw_tick = false;
+    let mut last_error = None;
     let mut greek_rank: u8 = 0;
     let deadline = tokio::time::sleep(Duration::from_secs(OPTION_SNAPSHOT_TIMEOUT_SECS));
     tokio::pin!(deadline);
@@ -1251,7 +1320,10 @@ async fn collect_option_snapshot_ticks(
                             _ => {}
                         }
                     }
-                    Some(Err(e)) => tracing::warn!("option snapshot error: {e}"),
+                    Some(Err(e)) => {
+                        tracing::warn!("option snapshot error: {e}");
+                        last_error = Some(IbError::from(e));
+                    }
                     None => break,
                 }
                 if option_snapshot_complete(&snap) {
@@ -1260,7 +1332,7 @@ async fn collect_option_snapshot_ticks(
             }
         }
     }
-    (snap, saw_tick)
+    SnapshotAttempt { snap, saw_tick, last_error }
 }
 
 /// Whether an option snapshot carries everything the caller needs: a usable
