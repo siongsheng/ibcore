@@ -945,8 +945,15 @@ impl IsZeroPriced for StockSnapshot {
 }
 
 impl IsZeroPriced for OptionSnapshot {
+    /// Aligns the retry/validity gate with the collector's early-break
+    /// definition (#24): an option snapshot is only usable when it has BOTH a
+    /// price and greeks, so anything incomplete (greeks-only, price-only) counts
+    /// as "needs retry" — not merely the all-zero-price case. Sharing
+    /// [`option_snapshot_complete`] keeps "complete" meaning the same thing in
+    /// both places, so greeks-arriving-first no longer yields a spurious
+    /// [`IbError::CompetingSession`].
     fn is_zero_priced(&self) -> bool {
-        self.bid <= 0.0 && self.ask <= 0.0 && self.last <= 0.0
+        !option_snapshot_complete(self)
     }
 }
 
@@ -1059,7 +1066,12 @@ async fn collect_option_snapshot_ticks(
                 Err(e) => tracing::warn!("option snapshot error: {e}"),
                 _ => {}
             }
-            if snap.option_iv > 0.0 || snap.option_delta != 0.0 {
+            // Break only once we have EVERYTHING the caller needs — a usable
+            // price AND greeks (#24). Breaking on greeks alone (IB does not
+            // guarantee price ticks arrive first) returned a zero-priced
+            // snapshot that then failed the retry gate. The 5s timeout below is
+            // the backstop that still returns whatever partial data arrived.
+            if option_snapshot_complete(&snap) {
                 break;
             }
         }
@@ -1069,6 +1081,15 @@ async fn collect_option_snapshot_ticks(
     tokio::time::timeout(Duration::from_secs(5), collect_fut)
         .await
         .unwrap_or_default()
+}
+
+/// Whether an option snapshot carries everything the caller needs: a usable
+/// price (bid or ask > 0) AND greeks (iv > 0 or delta != 0). Pure predicate
+/// shared by the early-break in [`collect_option_snapshot_ticks`] and the
+/// retry/validity gate ([`IsZeroPriced`] for [`OptionSnapshot`]), so "complete"
+/// means the same thing in both places (#24).
+fn option_snapshot_complete(snap: &OptionSnapshot) -> bool {
+    (snap.bid > 0.0 || snap.ask > 0.0) && (snap.option_iv > 0.0 || snap.option_delta != 0.0)
 }
 
 /// Distinct, ascending, positive strikes from raw `contract_details` strike
@@ -1519,6 +1540,76 @@ mod tests {
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.option_delta, 0.0);
+    }
+
+    // ── option-snapshot completeness (issue #24) ──
+
+    #[test]
+    fn option_snapshot_complete_requires_price_and_greeks() {
+        // Greeks only, no price — NOT complete (the #24 bug used to break here).
+        let greeks_only = OptionSnapshot {
+            option_iv: 0.25,
+            option_delta: 0.30,
+            ..Default::default()
+        };
+        assert!(!option_snapshot_complete(&greeks_only), "greeks without a price is incomplete");
+
+        // Price only, no greeks — NOT complete.
+        let price_only = OptionSnapshot { bid: 5.0, ask: 5.5, ..Default::default() };
+        assert!(!option_snapshot_complete(&price_only), "price without greeks is incomplete");
+
+        // Both a usable price and greeks — complete.
+        let both = OptionSnapshot {
+            bid: 5.0,
+            ask: 5.5,
+            option_delta: 0.30,
+            ..Default::default()
+        };
+        assert!(option_snapshot_complete(&both), "price + greeks is complete");
+    }
+
+    #[test]
+    fn option_snapshot_zero_priced_aligns_with_completeness() {
+        // #24: the retry/validity gate must use the same definition as the
+        // early-break — an incomplete snapshot counts as "needs retry".
+        let greeks_only = OptionSnapshot { option_delta: 0.30, ..Default::default() };
+        assert!(greeks_only.is_zero_priced(), "greeks-only must be treated as needing retry");
+
+        let complete = OptionSnapshot { bid: 5.0, option_delta: 0.30, ..Default::default() };
+        assert!(!complete.is_zero_priced(), "a complete snapshot must not trigger retry");
+    }
+
+    /// #24: greeks arrive BEFORE any price tick. The collector must not break
+    /// early and return a zero-priced snapshot — it must wait for the price.
+    #[tokio::test]
+    async fn collect_option_snapshot_waits_for_price_when_greeks_arrive_first() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.5,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let snap = collect_option_snapshot_ticks(stream).await;
+        assert!(
+            snap.bid > 0.0 || snap.ask > 0.0,
+            "collector must wait for a price tick, got bid={} ask={}",
+            snap.bid,
+            snap.ask
+        );
+        assert!(snap.option_delta != 0.0, "greeks must still be present");
     }
 
     // ── remote diagnostics tests ──
