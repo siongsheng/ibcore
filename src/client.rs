@@ -94,6 +94,29 @@ pub fn is_connection_dead(e: &IbError) -> bool {
     matches!(e, IbError::ConnectionReset | IbError::ConnectionFailed(_))
 }
 
+/// Build an [`IbError`] from a market-data subscribe/fetch failure, routing the
+/// raw [`ibapi::Error`] through [`IbError::from`] so it is classified correctly
+/// (#21).
+///
+/// Previously these paths hardcoded `IbError::MarketData { code: 0 }`, which
+/// discarded the real error: a reconnect-time `ConnectionReset` surfaced as
+/// `MarketData { code: 0 }` and [`is_connection_dead`] returned false, so
+/// callers missed the disconnect. Routing through [`IbError::from`] preserves
+/// classification (`ConnectionReset` → [`IbError::ConnectionReset`], a Notice →
+/// [`classify_notice`](crate::errors::classify_notice), IO → typed). Only a
+/// genuinely unclassifiable error ([`IbError::Other`]) falls back to
+/// [`IbError::MarketData`], where the `context` string is preserved for
+/// diagnosis.
+fn market_data_error(context: &str, e: ibapi::Error) -> IbError {
+    match IbError::from(e) {
+        IbError::Other(msg) => IbError::MarketData {
+            code: 0,
+            message: format!("{context}: {msg}"),
+        },
+        classified => classified,
+    }
+}
+
 impl IbClient {
     /// Access the underlying ibapi Client (cloning gives another `Arc` handle).
     pub fn inner(&self) -> Arc<ibapi::Client> {
@@ -485,10 +508,7 @@ impl IbClient {
             .snapshot()
             .subscribe()
             .await
-            .map_err(|e| IbError::MarketData {
-                code: 0,
-                message: format!("stock market data subscribe failed: {e}"),
-            })?;
+            .map_err(|e| market_data_error("stock market data subscribe failed", e))?;
         let data = sub.filter_data();
 
         let snap = collect_stock_snapshot_ticks(data).await;
@@ -675,10 +695,7 @@ impl IbClient {
             .market_data(contract)
             .subscribe()
             .await
-            .map_err(|e| IbError::MarketData {
-                code: 0,
-                message: format!("option market data subscribe failed: {e}"),
-            })?;
+            .map_err(|e| market_data_error("option market data subscribe failed", e))?;
         let data = sub.filter_data();
 
         let snap = collect_option_snapshot_ticks(data).await;
@@ -846,10 +863,7 @@ impl IbClient {
             .market_data(contract)
             .subscribe()
             .await
-            .map_err(|e| IbError::MarketData {
-                code: 0,
-                message: format!("tick_stream subscribe failed for {symbol}: {e}"),
-            })?;
+            .map_err(|e| market_data_error(&format!("tick_stream subscribe failed for {symbol}"), e))?;
         tracing::info!("tick_stream subscribed for {symbol}");
         Ok(TickStream::from_subscription(sub))
     }
@@ -895,10 +909,7 @@ impl IbClient {
             .trading_hours(trading_hours)
             .fetch()
             .await
-            .map_err(|e| IbError::MarketData {
-                code: 0,
-                message: format!("historical_data fetch failed for {symbol}: {e}"),
-            })?;
+            .map_err(|e| market_data_error(&format!("historical_data fetch failed for {symbol}"), e))?;
         tracing::info!(
             "historical_data fetched for {symbol}: {} bars, period {} to {}",
             data.bars.len(),
