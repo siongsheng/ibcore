@@ -379,25 +379,40 @@ fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
 /// be live/filling at IB, so the caller must reconcile rather than assume it
 /// died.
 ///
-/// Only a GENUINE broker rejection — a [`Notice`](ibapi::Notice) whose code is
-/// in the order-rejection range (200–299) — becomes [`IbError::OrderRejected`].
-/// Everything else (connection / IO / shutdown, or an out-of-range Notice such
-/// as a 502 raised while submitting) is classified via
-/// [`IbError::from`], which produces the connection-dead variant that
-/// [`crate::is_connection_dead`] recognises. The call-site `context` is
-/// preserved in the resulting message via
-/// [`with_context`](crate::errors::with_context) so diagnosis isn't lost.
+/// Classification rule:
+/// - **[`Notice`](ibapi::Notice) that classifies to a connection-dead variant**
+///   ([`classify_notice`](crate::errors::classify_notice) → `ConnectionFailed` /
+///   `ConnectionReset`, i.e. transport codes 502/504/506/507/100): the order may
+///   still be live at IB, so this maps to the connection-dead variant (with
+///   `context`), NOT a rejection. This is the #32 fix.
+/// - **Any other Notice** — including out-of-range broker rejections such as 110
+///   ("price does not conform to min variation") or 434 ("order size zero"), not
+///   just the 200–299 range — maps to [`IbError::OrderRejected`] via
+///   [`order_rejected_from`], preserving the real code and any advanced-reject
+///   JSON. These are genuine "the order did not go through" refusals.
+/// - **Non-`Notice` errors** (ibapi `ConnectionReset` / `ConnectionFailed` /
+///   `Shutdown` / `Io`): connection-dead via [`IbError::from`].
+///
+/// The call-site `context` is preserved in the resulting message
+/// ([`with_context`](crate::errors::with_context) for the connection-dead paths,
+/// [`order_rejected_from`] for the rejection path) so diagnosis isn't lost.
 fn order_submit_error(context: &str, err: ibapi::Error) -> IbError {
-    // A genuine broker rejection is a Notice in the 200–299 range — that is the
-    // ONLY case that proves the order will not work, so it maps to OrderRejected
-    // (via order_rejected_from, which already prefixes context).
-    if let ibapi::Error::Notice(notice) = &err
-        && (200..=299).contains(&notice.code)
-    {
+    if let ibapi::Error::Notice(notice) = &err {
+        let classified = crate::errors::classify_notice(
+            notice.code,
+            &notice.message,
+            &notice.advanced_order_reject_json,
+        );
+        // A transport-level Notice (502/504/506/507/100) is NOT a rejection —
+        // the order may still be working at IB, so keep it connection-dead.
+        if crate::is_connection_dead(&classified) {
+            return crate::errors::with_context(context, classified);
+        }
+        // Every other Notice — including out-of-range broker rejections — is a
+        // genuine rejection; preserve it as OrderRejected with its real code.
         return order_rejected_from(context, &err);
     }
-    // Otherwise reclassify (connection / IO / shutdown / out-of-range Notice),
-    // preserving the call-site context in the surfaced message.
+    // Non-Notice transport failures are connection-dead.
     crate::errors::with_context(context, IbError::from(err))
 }
 
