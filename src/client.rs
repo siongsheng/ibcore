@@ -1225,6 +1225,51 @@ mod tests {
         assert!(!is_connection_dead(&ib_err));
     }
 
+    // ── market_data_error classification tests (#21) ──
+    //
+    // Market-data subscribe/fetch failures must be classified via IbError::from
+    // rather than flattened to MarketData { code: 0 }, so a reconnect-time
+    // ConnectionReset is detectable by is_connection_dead.
+
+    #[test]
+    fn market_data_error_connection_reset_is_classified() {
+        let e = market_data_error("stock snapshot subscribe failed", ibapi::Error::ConnectionReset);
+        assert!(matches!(e, IbError::ConnectionReset));
+        assert!(is_connection_dead(&e));
+    }
+
+    #[test]
+    fn market_data_error_shutdown_is_connection_dead() {
+        let e = market_data_error("tick_stream subscribe failed", ibapi::Error::Shutdown);
+        assert!(is_connection_dead(&e));
+    }
+
+    #[test]
+    fn market_data_error_notice_is_classified_not_code_zero() {
+        let notice = ibapi::Notice {
+            code: 10199,
+            message: "market data not subscribed".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        let e = market_data_error("option snapshot subscribe failed", ibapi::Error::Notice(notice));
+        assert!(matches!(e, IbError::MarketData { code: 10199, .. }));
+    }
+
+    #[test]
+    fn market_data_error_unclassifiable_falls_back_with_context() {
+        // An error with no useful classification (Other) falls back to
+        // MarketData { code: 0 }, preserving the context string for diagnosis.
+        let e = market_data_error("historical_data fetch failed for SPY", ibapi::Error::NotImplemented);
+        match e {
+            IbError::MarketData { code, message } => {
+                assert_eq!(code, 0);
+                assert!(message.contains("historical_data fetch failed for SPY"));
+            }
+            other => panic!("expected MarketData fallback, got {other:?}"),
+        }
+    }
+
     // ── contract cache key tests ──
 
     #[test]
