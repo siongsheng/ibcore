@@ -403,4 +403,37 @@ mod tests {
         let ibe: IbError = err.into();
         assert!(matches!(ibe, IbError::ConnectionFailed(_)));
     }
+
+    // ── with_context tests (#32) ──
+
+    #[test]
+    fn with_context_prepends_to_message_variants() {
+        let cases = [
+            with_context("ctx", IbError::MarketData { code: 10199, message: "no sub".into() }),
+            with_context("ctx", IbError::ConnectionFailed("dropped".into())),
+            with_context("ctx", IbError::Timeout("slow".into())),
+            with_context("ctx", IbError::Other("weird".into())),
+            with_context("ctx", IbError::ContractResolution("bad".into())),
+        ];
+        for e in &cases {
+            assert!(
+                e.to_string().contains("ctx"),
+                "context prefix missing from {e}"
+            );
+        }
+        // The code / variant must be preserved, not flattened.
+        assert!(matches!(cases[0], IbError::MarketData { code: 10199, .. }));
+    }
+
+    #[test]
+    fn with_context_leaves_messageless_variants_unchanged() {
+        assert!(matches!(
+            with_context("ctx", IbError::ConnectionReset),
+            IbError::ConnectionReset
+        ));
+        assert!(matches!(
+            with_context("ctx", IbError::CompetingSession),
+            IbError::CompetingSession
+        ));
+    }
 }

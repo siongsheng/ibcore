@@ -1396,10 +1396,11 @@ mod tests {
     async fn collect_stock_snapshot_timeout_returns_default() {
         // A stream that never yields (simulates no data on the wire)
         let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let (snap, saw_tick) = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.last, 0.0);
+        assert!(!saw_tick, "no ticks arrived, so saw_tick must be false");
     }
 
     /// Stream with valid ticks → collects bid/ask/last and breaks early.
@@ -1420,7 +1421,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
         assert_eq!(snap.ask, 101.0);
     }
@@ -1443,7 +1444,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.close, 99.0);
         assert_eq!(snap.last, 100.5);
     }
@@ -1474,7 +1475,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
     }
 
@@ -1501,7 +1502,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
         assert_eq!(snap.ask, 101.0);
     }
@@ -1522,6 +1523,7 @@ mod tests {
                 ..Default::default()
             })),
             Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
                 implied_volatility: Some(0.25),
                 delta: Some(0.30),
                 gamma: Some(0.02),
@@ -1532,7 +1534,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_option_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 5.0);
         assert_eq!(snap.ask, 5.5);
         assert!((snap.option_iv - 0.25).abs() < 0.001);
@@ -1544,10 +1546,11 @@ mod tests {
     #[tokio::test]
     async fn collect_option_snapshot_timeout_returns_default() {
         let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let (snap, saw_tick) = collect_option_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.option_delta, 0.0);
+        assert!(!saw_tick, "no ticks arrived, so saw_tick must be false");
     }
 
     // ── option-snapshot completeness (issue #24) ──
@@ -1594,6 +1597,7 @@ mod tests {
         use ibapi::market_data::realtime::TickPrice;
         let ticks = vec![
             Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
                 implied_volatility: Some(0.25),
                 delta: Some(0.30),
                 ..Default::default()
@@ -1610,7 +1614,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let (snap, _saw_tick) = collect_option_snapshot_ticks(stream).await;
         assert!(
             snap.bid > 0.0 || snap.ask > 0.0,
             "collector must wait for a price tick, got bid={} ask={}",
@@ -1618,6 +1622,189 @@ mod tests {
             snap.ask
         );
         assert!(snap.option_delta != 0.0, "greeks must still be present");
+    }
+
+    // ── market_data_error context preservation (#32 R1) ──
+
+    #[test]
+    fn market_data_error_preserves_context_for_classified_variant() {
+        // A classified market-data Notice must keep the call-site context (e.g.
+        // the symbol) in its message, not drop it.
+        let notice = ibapi::Notice {
+            code: 10199,
+            message: "market data not subscribed".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        let e = market_data_error(
+            "stock market data subscribe failed for SPY",
+            ibapi::Error::Notice(notice),
+        );
+        match e {
+            IbError::MarketData { code, message } => {
+                assert_eq!(code, 10199);
+                assert!(
+                    message.contains("SPY"),
+                    "call-site context/symbol dropped: {message}"
+                );
+            }
+            other => panic!("expected MarketData, got {other:?}"),
+        }
+    }
+
+    // ── snapshot_failure_error classification (#27) ──
+    //
+    // A plain market-data TIMEOUT (no ticks arrived) must be Timeout, NOT
+    // CompetingSession. CompetingSession is reserved for the true 10197
+    // signature: ticks DID arrive but every price was zero across all attempts.
+
+    #[test]
+    fn snapshot_failure_no_ticks_is_timeout() {
+        let e = snapshot_failure_error(false, 5);
+        match e {
+            IbError::Timeout(msg) => assert!(msg.contains("timed out")),
+            other => panic!("no-ticks failure must be Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_failure_ticks_arrived_is_competing_session() {
+        assert!(matches!(
+            snapshot_failure_error(true, 5),
+            IbError::CompetingSession
+        ));
+    }
+
+    // ── collection_result decision (#27) ──
+    //
+    // Return Err when the terminating End sentinel was NOT observed OR a stream
+    // error occurred; a clean-but-empty result still returns Ok.
+
+    #[test]
+    fn collection_result_no_end_is_err() {
+        let r = collection_result("positions", false, false, vec![1, 2]);
+        assert!(r.is_err(), "missing End sentinel must be an error");
+    }
+
+    #[test]
+    fn collection_result_error_is_err() {
+        let r = collection_result("positions", true, true, vec![1, 2]);
+        assert!(r.is_err(), "a stream error must be an error even with End seen");
+    }
+
+    #[test]
+    fn collection_result_clean_empty_is_ok_empty() {
+        let r = collection_result::<i32>("positions", true, false, vec![]);
+        assert_eq!(r.unwrap(), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn collection_result_clean_full_is_ok_items() {
+        let r = collection_result("positions", true, false, vec![1, 2, 3]);
+        assert_eq!(r.unwrap(), vec![1, 2, 3]);
+    }
+
+    // ── option computation model-tick precedence (#27) ──
+
+    #[test]
+    fn option_computation_rank_model_outranks_last_and_bid() {
+        let model = option_computation_rank(&TickType::ModelOption).unwrap();
+        let last = option_computation_rank(&TickType::LastOption).unwrap();
+        let bid = option_computation_rank(&TickType::BidOption).unwrap();
+        let ask = option_computation_rank(&TickType::AskOption).unwrap();
+        assert!(model > last, "model must outrank last");
+        assert!(last > bid, "last must outrank bid");
+        assert_eq!(bid, ask, "bid and ask rank equally");
+        // Delayed variants mirror their realtime counterparts.
+        assert_eq!(
+            option_computation_rank(&TickType::DelayedModelOption),
+            Some(model)
+        );
+    }
+
+    #[test]
+    fn option_computation_rank_ignores_non_greek_fields() {
+        assert!(option_computation_rank(&TickType::Bid).is_none());
+        assert!(option_computation_rank(&TickType::Unknown).is_none());
+    }
+
+    #[test]
+    fn apply_option_computation_model_wins_over_later_bid() {
+        // A model tick's greeks must be retained even when a bid-side
+        // computation arrives AFTERWARDS.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::ModelOption,
+            implied_volatility: Some(0.25),
+            delta: Some(0.30),
+            ..Default::default()
+        });
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.99),
+            delta: Some(0.99),
+            ..Default::default()
+        });
+        assert!((snap.option_delta - 0.30).abs() < 0.001, "later bid overwrote model delta: {}", snap.option_delta);
+        assert!((snap.option_iv - 0.25).abs() < 0.001, "later bid overwrote model iv: {}", snap.option_iv);
+    }
+
+    #[test]
+    fn apply_option_computation_falls_back_when_no_model() {
+        // With no model tick, the collector still populates greeks from the
+        // best available (bid) so callers are not left with nothing.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.40),
+            delta: Some(0.22),
+            ..Default::default()
+        });
+        assert!((snap.option_delta - 0.22).abs() < 0.001);
+        assert!((snap.option_iv - 0.40).abs() < 0.001);
+    }
+
+    /// #27: the MODEL computation tick's greeks must win in the collector even
+    /// when bid-side computations arrive before and after it.
+    #[tokio::test]
+    async fn collect_option_snapshot_model_tick_greeks_win() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::BidOption,
+                implied_volatility: Some(0.99),
+                delta: Some(0.99),
+                ..Default::default()
+            })),
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                ..Default::default()
+            })),
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::AskOption,
+                implied_volatility: Some(0.88),
+                delta: Some(0.88),
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.5,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let (snap, _saw_tick) = collect_option_snapshot_ticks(stream).await;
+        assert!((snap.option_delta - 0.30).abs() < 0.001, "model delta must win, got {}", snap.option_delta);
+        assert!((snap.option_iv - 0.25).abs() < 0.001, "model iv must win, got {}", snap.option_iv);
     }
 
     // ── remote diagnostics tests ──
