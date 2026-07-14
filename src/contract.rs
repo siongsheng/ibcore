@@ -5,6 +5,21 @@
 
 use ibapi::contracts::{Contract, OptionRight, SecurityType};
 
+/// Default option contract multiplier for standard US-equity options.
+///
+/// Standard listed US-equity and ETF options carry a multiplier of `100` (one
+/// contract covers 100 shares). This crate currently assumes that standard
+/// multiplier everywhere it builds an option [`Contract`].
+///
+/// Non-standard multipliers are NOT currently supported: some index options
+/// use `50` or `1000`, and post-split contracts can carry an adjusted
+/// multiplier (e.g. `100` shares of the original × a split ratio). A contract
+/// built with this default will fail to match such instruments in
+/// `contract_details`. Parameterizing the multiplier is deliberately out of
+/// scope; this named constant documents the assumption and keeps the literal
+/// in one place.
+pub const DEFAULT_OPTION_MULTIPLIER: &str = "100";
+
 /// Build an IB option contract for `contract_details` resolution.
 ///
 /// Constructs a [`Contract`] for the specified symbol, expiry, strike, and
@@ -41,7 +56,9 @@ pub fn build_option_contract(
         last_trade_date_or_contract_month: expiry_str,
         strike,
         right: Some(right),
-        multiplier: "100".into(),
+        // Assumes standard US-equity options (multiplier 100); see
+        // DEFAULT_OPTION_MULTIPLIER for the unsupported non-standard cases.
+        multiplier: DEFAULT_OPTION_MULTIPLIER.into(),
         ..Default::default()
     }
 }
