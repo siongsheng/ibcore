@@ -16,6 +16,7 @@ use crate::errors::IbError;
 /// Maps ibapi's heterogeneous [`TickTypes`] into a flat, consumer-friendly
 /// enum. Each variant carries the data relevant to that kind of tick.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum TickEvent {
     /// Bid, ask, or last price update.
     Price {

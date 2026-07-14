@@ -51,6 +51,7 @@ pub struct OpenOrder {
 /// order update stream. Consumers match on these variants instead of
 /// interpreting raw [`ibapi::orders::OrderStatus`] fields.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum OrderStatusEvent {
     /// Order was acknowledged by IB.
     Submitted {
@@ -102,7 +103,11 @@ pub enum OrderStatusEvent {
 }
 
 /// Terminal outcome of an order placed via [`IbClient::place_order_await`].
+///
+/// `#[non_exhaustive]`: IB's order state space evolves, so consumers must
+/// include a wildcard arm — new variants are then additive, not breaking.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum OrderOutcome {
     /// Order filled. Carries fill quantity and average fill price.
     Filled {
@@ -245,6 +250,11 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
 /// function — the async loop in `place_order_await` is a thin wrapper over it.
 fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
     match ev {
+        // A Filled status can arrive before average_fill_price is populated
+        // (None → 0.0). Booking a $0 fill would corrupt P&L, so treat a
+        // priceless fill as non-terminal and keep waiting (#22). A genuine
+        // combo/strangle fill always carries a positive net price.
+        OrderStatusEvent::Filled { avg_price, .. } if avg_price <= 0.0 => None,
         OrderStatusEvent::Filled { order_id, filled_qty, avg_price, .. } => {
             Some(OrderOutcome::Filled { order_id, filled_qty, avg_price })
         }
