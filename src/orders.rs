@@ -120,8 +120,21 @@ pub enum OrderOutcome {
         /// Rejection reason from IB.
         reason: String,
     },
-    /// Order cancelled or went inactive before filling.
+    /// Order was explicitly cancelled before filling.
     Cancelled {
+        /// API-assigned order ID.
+        order_id: i32,
+        /// Reason, if any.
+        reason: String,
+    },
+    /// Order went inactive — IB accepted the message but the order is not
+    /// working. This is distinct from both [`Rejected`](Self::Rejected) (a hard
+    /// broker refusal) and [`Cancelled`](Self::Cancelled) (an explicit cancel):
+    /// IB reports `Inactive` for cases as varied as an invalid order that
+    /// triggered an error, or an order submitted while the market is closed.
+    /// Callers that only need "did not fill" can treat it like `Cancelled`;
+    /// the variant exists so callers that care can tell them apart.
+    Inactive {
         /// API-assigned order ID.
         order_id: i32,
         /// Reason, if any.
@@ -242,9 +255,34 @@ fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
             Some(OrderOutcome::Cancelled { order_id, reason })
         }
         OrderStatusEvent::Inactive { order_id } => {
-            Some(OrderOutcome::Rejected { order_id, reason: "order went inactive".to_string() })
+            Some(OrderOutcome::Inactive { order_id, reason: "order went inactive".to_string() })
         }
         OrderStatusEvent::Submitted { .. } | OrderStatusEvent::Other { .. } => None,
+    }
+}
+
+/// Build an [`IbError::OrderRejected`] from an order-submission failure,
+/// preserving the underlying IB error code (and any advanced-reject JSON) when
+/// the ibapi error is a [`Notice`](ibapi::Notice). Non-`Notice` errors
+/// (connection / IO / shutdown) carry no IB code, so `code: 0` is used and the
+/// original error is recorded in the message for diagnosis. Addresses #14,
+/// where every failure previously reported a meaningless `code: 0`.
+fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
+    match err {
+        ibapi::Error::Notice(notice) => IbError::OrderRejected {
+            code: notice.code,
+            message: format!("{context}: {}", notice.message),
+            rejection_json: if notice.advanced_order_reject_json.is_empty() {
+                None
+            } else {
+                Some(notice.advanced_order_reject_json.clone())
+            },
+        },
+        other => IbError::OrderRejected {
+            code: 0,
+            message: format!("{context}: {other}"),
+            rejection_json: None,
+        },
     }
 }
 
@@ -278,20 +316,12 @@ impl IbClient {
             .inner()
             .next_valid_order_id()
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("failed to get order ID: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("failed to get order ID", &e))?;
 
         self.inner()
             .submit_order(order_id, contract, order)
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("submit_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("submit_order failed", &e))?;
 
         Ok(order_id)
     }
@@ -316,11 +346,7 @@ impl IbClient {
             .inner()
             .place_order(order_id, contract, order)
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("place_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("place_order failed", &e))?;
 
         let outcome = tokio::time::timeout(timeout, async {
             let mut data = sub.filter_data();
@@ -357,11 +383,7 @@ impl IbClient {
             .inner()
             .cancel_order(order_id, "")
             .await
-            .map_err(|e| IbError::OrderRejected {
-                code: 0,
-                message: format!("cancel_order failed: {e}"),
-                rejection_json: None,
-            })?;
+            .map_err(|e| order_rejected_from("cancel_order failed", &e))?;
         Ok(())
     }
 
