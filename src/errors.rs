@@ -23,6 +23,7 @@ use std::fmt;
 /// | `ContractResolution`| (derived from API calls)   |
 /// | `Other`             | everything else             |
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IbError {
     /// Connection could not be established or was lost.
     ConnectionFailed(String),
