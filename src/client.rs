@@ -934,8 +934,15 @@ impl IsZeroPriced for StockSnapshot {
 }
 
 impl IsZeroPriced for OptionSnapshot {
+    /// Aligns the retry/validity gate with the collector's early-break
+    /// definition (#24): an option snapshot is only usable when it has BOTH a
+    /// price and greeks, so anything incomplete (greeks-only, price-only) counts
+    /// as "needs retry" — not merely the all-zero-price case. Sharing
+    /// [`option_snapshot_complete`] keeps "complete" meaning the same thing in
+    /// both places, so greeks-arriving-first no longer yields a spurious
+    /// [`IbError::CompetingSession`].
     fn is_zero_priced(&self) -> bool {
-        self.bid <= 0.0 && self.ask <= 0.0 && self.last <= 0.0
+        !option_snapshot_complete(self)
     }
 }
 
@@ -1048,7 +1055,12 @@ async fn collect_option_snapshot_ticks(
                 Err(e) => tracing::warn!("option snapshot error: {e}"),
                 _ => {}
             }
-            if snap.option_iv > 0.0 || snap.option_delta != 0.0 {
+            // Break only once we have EVERYTHING the caller needs — a usable
+            // price AND greeks (#24). Breaking on greeks alone (IB does not
+            // guarantee price ticks arrive first) returned a zero-priced
+            // snapshot that then failed the retry gate. The 5s timeout below is
+            // the backstop that still returns whatever partial data arrived.
+            if option_snapshot_complete(&snap) {
                 break;
             }
         }
@@ -1058,6 +1070,15 @@ async fn collect_option_snapshot_ticks(
     tokio::time::timeout(Duration::from_secs(5), collect_fut)
         .await
         .unwrap_or_default()
+}
+
+/// Whether an option snapshot carries everything the caller needs: a usable
+/// price (bid or ask > 0) AND greeks (iv > 0 or delta != 0). Pure predicate
+/// shared by the early-break in [`collect_option_snapshot_ticks`] and the
+/// retry/validity gate ([`IsZeroPriced`] for [`OptionSnapshot`]), so "complete"
+/// means the same thing in both places (#24).
+fn option_snapshot_complete(snap: &OptionSnapshot) -> bool {
+    (snap.bid > 0.0 || snap.ask > 0.0) && (snap.option_iv > 0.0 || snap.option_delta != 0.0)
 }
 
 /// Distinct, ascending, positive strikes from raw `contract_details` strike
