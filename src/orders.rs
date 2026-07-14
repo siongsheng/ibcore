@@ -267,6 +267,12 @@ fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
 /// (connection / IO / shutdown) carry no IB code, so `code: 0` is used and the
 /// original error is recorded in the message for diagnosis. Addresses #14,
 /// where every failure previously reported a meaningless `code: 0`.
+///
+/// Note: unlike [`classify_notice`](crate::errors::classify_notice), this always
+/// yields [`IbError::OrderRejected`] — even for a `Notice` whose code is outside
+/// the 200–299 order-rejection range (e.g. a 502 raised while submitting). In an
+/// order-submission context "the order didn't go through" is the salient fact;
+/// the real code is still preserved for diagnosis rather than flattened to 0.
 fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
     match err {
         ibapi::Error::Notice(notice) => IbError::OrderRejected {
@@ -335,6 +341,15 @@ impl IbClient {
     /// learns the actual fill price or the rejection reason instead of
     /// assuming success. Returns [`OrderOutcome::Pending`] if no terminal
     /// status arrives within `timeout` (the order may still be working).
+    ///
+    /// # Rejection vs. inactive
+    /// IB delivers a rejection as up to two messages on this subscription — an
+    /// error/`Notice` and an `OrderStatus` with status `Inactive`. This loop
+    /// returns on whichever arrives first, so a rejected order may surface as
+    /// either [`OrderOutcome::Rejected`] (error seen first) or
+    /// [`OrderOutcome::Inactive`] (status seen first). Callers must therefore
+    /// treat `Inactive` as "did not fill — possibly rejected", not as a benign
+    /// working state.
     pub async fn place_order_await(
         &self,
         order_id: i32,
@@ -689,10 +704,14 @@ mod tests {
         // Connection / IO / shutdown errors carry no IB code — code 0, but the
         // original error is preserved in the message for diagnosis.
         let err = ibapi::Error::ConnectionFailed;
+        let underlying = err.to_string();
         match order_rejected_from("place_order failed", &err) {
             IbError::OrderRejected { code, message, rejection_json } => {
                 assert_eq!(code, 0);
                 assert!(message.starts_with("place_order failed:"));
+                // The underlying error text must survive into the message so the
+                // failure is diagnosable — not just the context prefix.
+                assert!(message.contains(&underlying), "message dropped the underlying error: {message}");
                 assert!(rejection_json.is_none());
             }
             other => panic!("expected OrderRejected, got {other:?}"),
