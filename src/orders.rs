@@ -50,6 +50,11 @@ pub struct OpenOrder {
 /// Provides a simplified, typed view of order state changes from IB's
 /// order update stream. Consumers match on these variants instead of
 /// interpreting raw [`ibapi::orders::OrderStatus`] fields.
+///
+/// `#[non_exhaustive]`: this mirrors IB's evolving order-status space, so new
+/// variants must stay additive for downstream consumers (same policy as
+/// [`OrderOutcome`]; contrast [`crate::diagnostics::FarmState`], which is
+/// closed because its `Unknown(i32)` catch-all already absorbs new codes).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum OrderStatusEvent {
@@ -250,11 +255,13 @@ fn map_order_status(status: &ibapi::orders::OrderStatus) -> OrderStatusEvent {
 /// function — the async loop in `place_order_await` is a thin wrapper over it.
 fn classify_terminal(ev: OrderStatusEvent) -> Option<OrderOutcome> {
     match ev {
-        // A Filled status can arrive before average_fill_price is populated
-        // (None → 0.0). Booking a $0 fill would corrupt P&L, so treat a
-        // priceless fill as non-terminal and keep waiting (#22). A genuine
-        // combo/strangle fill always carries a positive net price.
-        OrderStatusEvent::Filled { avg_price, .. } if avg_price <= 0.0 => None,
+        // A Filled status can arrive before average_fill_price is populated:
+        // `map_order_status` maps IB's `Option<f64>` average price with
+        // `unwrap_or(0.0)`, so a not-yet-priced fill surfaces here as
+        // `avg_price == 0.0`. Booking a $0 fill would corrupt P&L, so treat a
+        // priceless (or NaN) fill as non-terminal and keep waiting (#22). A
+        // genuine combo/strangle fill always carries a positive net price.
+        OrderStatusEvent::Filled { avg_price, .. } if avg_price <= 0.0 || avg_price.is_nan() => None,
         OrderStatusEvent::Filled { order_id, filled_qty, avg_price, .. } => {
             Some(OrderOutcome::Filled { order_id, filled_qty, avg_price })
         }
@@ -650,6 +657,20 @@ mod tests {
             execution_id: None,
         };
         assert!(classify_terminal(ev).is_none(), "priceless fill must not be terminal");
+    }
+
+    #[test]
+    fn classify_filled_nan_price_is_not_terminal() {
+        // A NaN avg_price must not slip through `<= 0.0` (all NaN comparisons
+        // are false) and book a NaN fill.
+        let ev = OrderStatusEvent::Filled {
+            order_id: 7,
+            filled_qty: 1.0,
+            avg_price: f64::NAN,
+            commission: None,
+            execution_id: None,
+        };
+        assert!(classify_terminal(ev).is_none(), "NaN-priced fill must not be terminal");
     }
 
     #[test]

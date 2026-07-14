@@ -15,6 +15,10 @@ use crate::errors::IbError;
 ///
 /// Maps ibapi's heterogeneous [`TickTypes`] into a flat, consumer-friendly
 /// enum. Each variant carries the data relevant to that kind of tick.
+///
+/// `#[non_exhaustive]`: IB adds new tick types over time, so new variants must
+/// stay additive for downstream consumers (same policy as
+/// [`crate::OrderOutcome`]).
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum TickEvent {
