@@ -23,8 +23,26 @@ Pre-1.0, a breaking change bumps the MINOR version.
   Strike enumeration now returns every listed strike for the expiry regardless
   of multiplier, instead of silently excluding non-standard-multiplier listings
   (#18).
+- **BREAKING (behavioral):** `place_order_await` now returns `OrderOutcome::Pending`
+  (not `Rejected`) when the order subscription errors from a transport failure
+  (e.g. a mid-flight connection drop); only a proven IB `OrderRejected` maps to
+  `Rejected`. Callers reconcile a `Pending` via the order-status stream instead
+  of assuming the order was refused (#20).
+- Market-data subscribe/fetch failures are now classified through `IbError::from`
+  (preserving `ConnectionReset`/`ConnectionFailed` so `is_connection_dead` works)
+  instead of being flattened to `MarketData { code: 0 }` (#21).
+- `CommissionReport` now maps to the new `OrderStatusEvent::Commission` variant;
+  consequently `OrderStatusEvent::Filled`'s `commission`/`execution_id` fields
+  are now always `None` (correlate via `Execution`/`Commission` instead) (#23).
+- Option snapshots now require a usable price **and** greeks before an early
+  return, eliminating a spurious `CompetingSession` error when greeks arrive
+  before price ticks (#24).
 
 ### Added
+- `OrderStatusEvent::Execution` and `OrderStatusEvent::Commission` — surface IB
+  execution reports (carrying `order_id` + `execution_id`) and commission
+  reports (`execution_id` + `commission`) so a consumer can join a commission
+  back to the order that generated it (#23).
 - `OrderOutcome::Inactive` — a distinct terminal outcome for an order IB
   accepted but is not working (e.g. an invalid order that errored, or an order
   submitted while the market is closed), separate from a hard `Rejected` or an
