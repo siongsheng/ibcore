@@ -133,6 +133,52 @@ pub fn classify_notice(code: i32, message: &str, rejection_json: &str) -> IbErro
     }
 }
 
+/// Prepend a call-site `context` to a classified [`IbError`]'s message so the
+/// origin of the failure survives reclassification (#32).
+///
+/// When a submit/cancel or market-data failure is reclassified away from a
+/// blunt `OrderRejected`/`MarketData{code:0}` into its true variant (a
+/// connection drop, a real Notice code, a timeout), the useful call-site detail
+/// — which operation failed, which symbol — would otherwise be lost. This
+/// re-wraps the message as `"{context}: {message}"` for every variant that
+/// carries a human-readable message. Variants with no message field
+/// ([`IbError::ConnectionReset`], [`IbError::CompetingSession`]) are returned
+/// unchanged — they are self-describing and there is nothing to annotate.
+///
+/// `pub(crate)` because both the order path ([`crate::orders`]) and the
+/// market-data path ([`crate::client`]) share it.
+pub(crate) fn with_context(context: &str, err: IbError) -> IbError {
+    match err {
+        IbError::ConnectionFailed(msg) => {
+            IbError::ConnectionFailed(format!("{context}: {msg}"))
+        }
+        IbError::MarketData { code, message } => IbError::MarketData {
+            code,
+            message: format!("{context}: {message}"),
+        },
+        IbError::OrderRejected {
+            code,
+            message,
+            rejection_json,
+        } => IbError::OrderRejected {
+            code,
+            message: format!("{context}: {message}"),
+            rejection_json,
+        },
+        IbError::FarmDisconnect { code, message } => IbError::FarmDisconnect {
+            code,
+            message: format!("{context}: {message}"),
+        },
+        IbError::ContractResolution(msg) => {
+            IbError::ContractResolution(format!("{context}: {msg}"))
+        }
+        IbError::Timeout(msg) => IbError::Timeout(format!("{context}: {msg}")),
+        IbError::Other(msg) => IbError::Other(format!("{context}: {msg}")),
+        // No message field to annotate; the variant is self-describing.
+        other @ (IbError::ConnectionReset | IbError::CompetingSession) => other,
+    }
+}
+
 impl From<ibapi::Error> for IbError {
     fn from(err: ibapi::Error) -> Self {
         match err {
