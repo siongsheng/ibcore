@@ -23,7 +23,7 @@ use ibapi::{
         types::{AccountGroup, AccountId},
         AccountSummaryResult, PositionUpdate,
     },
-    contracts::{Contract, OptionRight, SecurityType, tick_types::TickType},
+    contracts::{Contract, OptionComputation, OptionRight, SecurityType, tick_types::TickType},
     market_data::MarketDataType,
     market_data::realtime::TickTypes,
     market_data::historical::{
@@ -107,14 +107,63 @@ pub fn is_connection_dead(e: &IbError) -> bool {
 /// genuinely unclassifiable error ([`IbError::Other`]) falls back to
 /// [`IbError::MarketData`], where the `context` string is preserved for
 /// diagnosis.
+///
+/// Classified variants also keep the call-site `context` (e.g. the symbol) in
+/// their message via [`with_context`](crate::errors::with_context) (#32 R1) —
+/// previously the symbol was dropped for anything that classified cleanly.
 fn market_data_error(context: &str, e: ibapi::Error) -> IbError {
     match IbError::from(e) {
         IbError::Other(msg) => IbError::MarketData {
             code: 0,
             message: format!("{context}: {msg}"),
         },
-        classified => classified,
+        classified => crate::errors::with_context(context, classified),
     }
+}
+
+/// Decide whether a streamed collection completed cleanly (#27).
+///
+/// IB delivers one-shot collections (positions, account summary) as a sequence
+/// terminated by an End sentinel. Returning whatever was collected when that
+/// sentinel never arrived — or after a mid-stream error — hands the caller
+/// TRUNCATED data as if it were complete, and huat sizes orders off these. This
+/// mirrors the correct pattern already used by [`IbClient::pnl`]: surface an
+/// [`Err`] when the End sentinel was NOT observed OR a stream error occurred; a
+/// clean-but-empty result is a legitimate [`Ok`] (e.g. an account with no
+/// positions). Pure, so the decision is unit-testable without a live gateway.
+fn collection_result<T>(
+    what: &str,
+    saw_end: bool,
+    saw_error: bool,
+    items: Vec<T>,
+) -> Result<Vec<T>, IbError> {
+    if saw_error {
+        return Err(IbError::Other(format!(
+            "{what}: stream error before completion — data may be truncated"
+        )));
+    }
+    if !saw_end {
+        return Err(IbError::Other(format!(
+            "{what}: stream ended without End sentinel — data may be truncated"
+        )));
+    }
+    Ok(items)
+}
+
+/// Extract NetLiquidation from an account-summary result (#27).
+///
+/// Pure so the phantom-zero guard is unit-testable without a live gateway:
+/// a present-but-unparseable value is an [`Err`] (not `Ok(0.0)`), an absent tag
+/// is an [`Err`], and only a real numeric value is [`Ok`].
+fn parse_net_liquidation(summary: &[(String, String, String, String)]) -> Result<f64, IbError> {
+    for (_account, tag, value, _currency) in summary {
+        if tag == "NetLiquidation" {
+            return value.parse::<f64>().map_err(|_| {
+                IbError::Other(format!("NetLiquidation unparseable: {value:?}"))
+            });
+        }
+    }
+    Err(IbError::Other("NetLiquidation not returned".into()))
 }
 
 impl IbClient {
@@ -472,14 +521,23 @@ impl IbClient {
             .map_err(|e| IbError::Other(format!("positions failed: {e}")))?;
         let mut data = sub.filter_data();
         let mut positions = Vec::new();
+        let mut saw_end = false;
+        let mut saw_error = false;
         while let Some(item) = data.next().await {
             match item {
                 Ok(PositionUpdate::Position(p)) => positions.push(p),
-                Ok(PositionUpdate::PositionEnd) => break,
-                Err(e) => tracing::warn!("position stream error: {e}"),
+                Ok(PositionUpdate::PositionEnd) => {
+                    saw_end = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("position stream error: {e}");
+                    saw_error = true;
+                    break;
+                }
             }
         }
-        Ok(positions)
+        collection_result("positions", saw_end, saw_error, positions)
     }
 
     /// Fetch account summary tags.
@@ -494,16 +552,25 @@ impl IbClient {
             .map_err(|e| IbError::Other(format!("account_summary failed: {e}")))?;
         let mut data = sub.filter_data();
         let mut results = Vec::new();
+        let mut saw_end = false;
+        let mut saw_error = false;
         while let Some(item) = data.next().await {
             match item {
                 Ok(AccountSummaryResult::Summary(s)) => {
                     results.push((s.account, s.tag, s.value, s.currency));
                 }
-                Ok(AccountSummaryResult::End) => break,
-                Err(e) => tracing::warn!("account summary error: {e}"),
+                Ok(AccountSummaryResult::End) => {
+                    saw_end = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("account summary error: {e}");
+                    saw_error = true;
+                    break;
+                }
             }
         }
-        Ok(results)
+        collection_result("account_summary", saw_end, saw_error, results)
     }
 
     /// Fetch P&L for an account.
@@ -526,17 +593,31 @@ impl IbClient {
     /// Get a market data snapshot for a stock or index.
     ///
     /// Retries up to 3 times with exponential backoff when the snapshot returns
-    /// all-zero bid/ask/last prices (competing live session blocking paper data).
+    /// all-zero prices. On exhaustion returns [`IbError::CompetingSession`] only
+    /// when ticks arrived but were all zero (the 10197 signature),
+    /// [`IbError::Timeout`] when no ticks arrived at all, or the underlying
+    /// stream error if one was recorded (#27).
     pub async fn stock_snapshot(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
-        retry_market_data(|| self.stock_snapshot_inner(symbol)).await
+        retry_market_data(
+            || self.stock_snapshot_inner(symbol),
+            STOCK_SNAPSHOT_TIMEOUT_SECS,
+        )
+        .await
     }
 
     /// Single stock snapshot attempt — no retry.
-    /// 
-    /// Uses streaming market data with a 5-second timeout instead of the
-    /// ibapi snapshot API, which returns 10197 on Gateway 10.45+.
+    ///
+    /// Uses streaming market data with a timeout instead of the ibapi snapshot
+    /// API, which returns 10197 on Gateway 10.45+.
     /// See https://github.com/wboayue/rust-ibapi/issues/683
-    async fn stock_snapshot_inner(&self, symbol: &str) -> Result<StockSnapshot, IbError> {
+    ///
+    /// Returns a [`SnapshotAttempt`] so [`retry_market_data`] can tell a plain
+    /// timeout (no ticks) from the competing-session signature (ticks arrived,
+    /// all zero) and can surface a recorded stream error.
+    async fn stock_snapshot_inner(
+        &self,
+        symbol: &str,
+    ) -> Result<SnapshotAttempt<StockSnapshot>, IbError> {
         let contract = if symbol == "VIX" {
             Contract {
                 symbol: symbol.into(),
@@ -559,10 +640,10 @@ impl IbClient {
             .map_err(|e| market_data_error("stock market data subscribe failed", e))?;
         let data = sub.filter_data();
 
-        let snap = collect_stock_snapshot_ticks(data).await;
+        let result = collect_stock_snapshot_ticks(data).await;
 
         // sub dropped here → streaming subscription cancelled
-        Ok(snap)
+        Ok(result)
     }
 
     /// Get a market data snapshot for an option by resolving the contract
@@ -680,8 +761,10 @@ impl IbClient {
     /// Get a market data snapshot for an option using an already-resolved
     /// IB contract.
     ///
-    /// Retries up to 3 times with exponential backoff when the snapshot returns
-    /// all-zero prices (error 10197: competing live session blocking paper data).
+    /// Retries up to 3 times with exponential backoff when the snapshot is
+    /// incomplete. On exhaustion returns [`IbError::CompetingSession`] (ticks
+    /// arrived, all zero — the 10197 signature), [`IbError::Timeout`] (no ticks),
+    /// or the underlying stream error if one was recorded (#27).
     pub async fn option_snapshot_from_contract(
         &self,
         contract: &ibapi::contracts::Contract,
@@ -690,14 +773,16 @@ impl IbClient {
     }
 
     /// Single snapshot attempt — no retry.
-    /// 
-    /// Uses streaming market data with a 5-second timeout instead of the
-    /// ibapi snapshot API, which returns 10197 on Gateway 10.45+.
+    ///
+    /// Uses streaming market data with a timeout instead of the ibapi snapshot
+    /// API, which returns 10197 on Gateway 10.45+.
     /// See https://github.com/wboayue/rust-ibapi/issues/683
+    ///
+    /// Returns a [`SnapshotAttempt`] — see [`stock_snapshot_inner`](Self::stock_snapshot_inner).
     async fn snapshot_inner(
         &self,
         contract: &ibapi::contracts::Contract,
-    ) -> Result<OptionSnapshot, IbError> {
+    ) -> Result<SnapshotAttempt<OptionSnapshot>, IbError> {
         let sub = self
             .inner
             .market_data(contract)
@@ -706,10 +791,10 @@ impl IbClient {
             .map_err(|e| market_data_error("option market data subscribe failed", e))?;
         let data = sub.filter_data();
 
-        let snap = collect_option_snapshot_ticks(data).await;
+        let result = collect_option_snapshot_ticks(data).await;
 
         // sub dropped here → streaming subscription cancelled
-        Ok(snap)
+        Ok(result)
     }
 
     /// Fetch the option chain (expirations + strikes) for an underlying.
@@ -928,14 +1013,13 @@ impl IbClient {
     }
 
     /// Fetch NetLiquidation from account summary.
+    ///
+    /// Returns `Err` (not a phantom `Ok(0.0)`) when the tag is absent from a
+    /// cleanly-completed summary OR present but unparseable, so huat never sizes
+    /// orders off a fabricated zero and instead reuses its cached net-liq (#27).
     pub async fn net_liquidation(&self, _account_id: &str) -> Result<f64, IbError> {
         let summary = self.account_summary(&["NetLiquidation"]).await?;
-        for (_account, tag, value, _currency) in summary {
-            if tag == "NetLiquidation" {
-                return Ok(value.parse().unwrap_or(0.0));
-            }
-        }
-        Ok(0.0)
+        parse_net_liquidation(&summary)
     }
 }
 
@@ -965,130 +1049,290 @@ impl IsZeroPriced for OptionSnapshot {
     }
 }
 
+/// Streaming-snapshot collection timeout for stocks/indices (seconds).
+const STOCK_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
+/// Streaming-snapshot collection timeout for options (seconds).
+const OPTION_SNAPSHOT_TIMEOUT_SECS: u64 = 5;
+
+/// Outcome of one snapshot-collection attempt (internal).
+///
+/// Carries enough context for [`retry_market_data`] to classify a failure
+/// correctly: whether any tick arrived (timeout vs competing session, #27) and
+/// the last stream error seen (surfaced instead of a fabricated timeout, #27
+/// review FIX 2).
+struct SnapshotAttempt<T> {
+    /// Whatever data was gathered before completion/timeout.
+    snap: T,
+    /// True if ANY market-data tick arrived (even zero-priced).
+    saw_tick: bool,
+    /// The last stream error observed, if any.
+    last_error: Option<IbError>,
+}
+
+/// Decide the terminal error when a snapshot never produced usable data after
+/// all retry attempts are exhausted (#27).
+///
+/// Precedence:
+/// - `last_error` present → surface that real stream error (never mask a genuine
+///   error with a fabricated timeout, #27 review FIX 2);
+/// - else `saw_tick` (ticks arrived but every price was zero) → the genuine
+///   competing-session (10197) signature → [`IbError::CompetingSession`];
+/// - else (no ticks at all) → a plain market-data TIMEOUT → [`IbError::Timeout`].
+///
+/// Before this split, a timeout produced an all-zero snapshot indistinguishable
+/// from 10197 zeroing, so both wrongly surfaced as `CompetingSession`. Pure, so
+/// the decision is unit-testable without a live gateway.
+fn snapshot_failure_error(saw_tick: bool, timeout_secs: u64, last_error: Option<IbError>) -> IbError {
+    if let Some(err) = last_error {
+        return err;
+    }
+    if saw_tick {
+        IbError::CompetingSession
+    } else {
+        IbError::Timeout(format!(
+            "market data snapshot timed out after {timeout_secs}s — no ticks received"
+        ))
+    }
+}
+
 /// Retry a snapshot with exponential backoff when all prices are zero.
 ///
 /// Error 10197 ("competing live session") causes IB to return empty market data
 /// on paper accounts when a live Gateway is also connected. Retrying with delay
 /// gives the market data stream time to recover.
-async fn retry_market_data<T, F, Fut>(mut fetch: F) -> Result<T, IbError>
+///
+/// `fetch` yields a [`SnapshotAttempt`]; on exhaustion the terminal error is
+/// [`snapshot_failure_error`] — a recorded stream error is surfaced, else a
+/// plain timeout (no ticks) becomes [`IbError::Timeout`] and ticks-arrived-all-
+/// zero becomes [`IbError::CompetingSession`] (#27).
+///
+/// `timeout_secs` is only for the failure message; it MUST match the collector's
+/// internal deadline constant ([`STOCK_SNAPSHOT_TIMEOUT_SECS`] /
+/// [`OPTION_SNAPSHOT_TIMEOUT_SECS`]) so the reported duration is truthful.
+async fn retry_market_data<T, F, Fut>(mut fetch: F, timeout_secs: u64) -> Result<T, IbError>
 where
     T: IsZeroPriced,
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, IbError>>,
+    Fut: std::future::Future<Output = Result<SnapshotAttempt<T>, IbError>>,
 {
+    let mut saw_tick = false;
+    let mut last_error = None;
     for attempt in 0..3 {
-        let snap = fetch().await?;
-        if !snap.is_zero_priced() {
-            return Ok(snap);
+        let a = fetch().await?;
+        if !a.snap.is_zero_priced() {
+            return Ok(a.snap);
+        }
+        saw_tick |= a.saw_tick;
+        // Keep the most recent stream error so a persistent failure surfaces the
+        // real cause rather than a fabricated "no ticks" timeout (#27 FIX 2).
+        if a.last_error.is_some() {
+            last_error = a.last_error;
         }
         let delay_ms = 1000 * (1 << attempt);
         tracing::warn!(
-            "empty market data (attempt {}/3, competing session?) — retrying in {}s",
+            "empty market data (attempt {}/3, saw_tick={}) — retrying in {}s",
             attempt + 1,
+            a.saw_tick,
             delay_ms / 1000,
         );
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
-    tracing::error!(
-        "market data persistently empty after 3 retries — \
-         competing live session likely blocking paper data. \
-         Stop the live Gateway (port 4001) or use delayed market data."
-    );
-    Err(IbError::CompetingSession)
+    if let Some(ref err) = last_error {
+        tracing::error!("market data failed with a stream error after 3 retries: {err}");
+    } else if saw_tick {
+        tracing::error!(
+            "market data persistently zero-priced after 3 retries — \
+             competing live session likely blocking paper data. \
+             Stop the live Gateway (port 4001) or use delayed market data."
+        );
+    } else {
+        tracing::error!(
+            "market data snapshot timed out after {timeout_secs}s with no ticks \
+             across 3 retries — data farm may be down or the symbol not subscribed."
+        );
+    }
+    Err(snapshot_failure_error(saw_tick, timeout_secs, last_error))
 }
 
-/// Retry a snapshot — delegates to [`retry_market_data`].
+/// Retry an option snapshot — delegates to [`retry_market_data`].
 async fn retry_snapshot<F, Fut>(fetch: F) -> Result<OptionSnapshot, IbError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<OptionSnapshot, IbError>>,
+    Fut: std::future::Future<Output = Result<SnapshotAttempt<OptionSnapshot>, IbError>>,
 {
-    retry_market_data(fetch).await
+    retry_market_data(fetch, OPTION_SNAPSHOT_TIMEOUT_SECS).await
 }
 
 // ── Streaming snapshot collection (workaround for ibapi snapshot 10197) ──
 
-async fn collect_stock_snapshot_ticks(
-    mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
-) -> StockSnapshot {
-    let collect_fut = async {
-        let mut snap = StockSnapshot::default();
-        while let Some(item) = data.next().await {
-            match item {
-                Ok(TickTypes::Price(price)) => match price.tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = price.price,
-                    TickType::Close | TickType::DelayedClose => snap.close = price.price,
-                    _ => {}
-                },
-                Ok(TickTypes::PriceSize(ps)) => match ps.price_tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = ps.price,
-                    _ => {}
-                },
-                Err(e) => tracing::warn!("stock snapshot error: {e}"),
-                _ => {}
-            }
-            if snap.last > 0.0 || (snap.bid > 0.0 && snap.ask > 0.0) {
-                break;
-            }
-        }
-        snap
-    };
-
-    tokio::time::timeout(Duration::from_secs(10), collect_fut)
-        .await
-        .unwrap_or_default()
+/// Rank an option-computation tick by which price its greeks are based on (#27).
+///
+/// IB emits BidOption=10 / AskOption=11 / LastOption=12 / ModelOption=13
+/// computation ticks (plus delayed 80–83). The MODEL tick carries the greeks/IV
+/// TWS shows and that huat's screener expects, so it must win; last/bid/ask are
+/// only fallbacks when no model tick ever arrives. Higher rank wins. Returns
+/// `None` for computation fields we never source greeks from.
+fn option_computation_rank(field: &TickType) -> Option<u8> {
+    match field {
+        TickType::ModelOption | TickType::DelayedModelOption => Some(3),
+        TickType::LastOption | TickType::DelayedLastOption => Some(2),
+        TickType::BidOption
+        | TickType::AskOption
+        | TickType::DelayedBidOption
+        | TickType::DelayedAskOption => Some(1),
+        _ => None,
+    }
 }
 
-async fn collect_option_snapshot_ticks(
+/// Apply an option-computation tick to `snap`, honoring model-tick precedence
+/// (#27). `current_rank` tracks the rank of the greeks already stored; a tick is
+/// applied only when its rank is >= the stored one, so a later bid/ask tick
+/// never overwrites a model tick, but a model tick overwrites an earlier
+/// bid/ask/last. Fix A (internal): greeks stay `f64` — `Option<f64>` is deferred
+/// (Fix B). Kept separate from the collector so the precedence rule is
+/// unit-testable without a live gateway.
+///
+/// Placeholder guard (#27 review FIX 1): IB signals "not yet computed" greeks as
+/// `f64::MAX`, which ibapi decodes to `None`. A computation tick carrying neither
+/// IV nor delta is such a placeholder — it must NOT touch `snap` or
+/// `current_rank`, otherwise a placeholder `ModelOption` arriving first would
+/// lock rank 3 and zero the greeks (rejecting a later real bid), and a same-rank
+/// placeholder resend would zero previously-good greeks. Because a skipped
+/// placeholder never advances `current_rank`, it can neither lock out nor zero a
+/// real value.
+fn apply_option_computation(snap: &mut OptionSnapshot, current_rank: &mut u8, opt: &OptionComputation) {
+    let rank = match option_computation_rank(&opt.field) {
+        Some(r) => r,
+        None => return,
+    };
+    // Skip placeholder ticks that carry no real greeks (all-None from f64::MAX).
+    if opt.implied_volatility.is_none() && opt.delta.is_none() {
+        return;
+    }
+    if rank < *current_rank {
+        return;
+    }
+    *current_rank = rank;
+    snap.option_iv = opt.implied_volatility.unwrap_or(0.0);
+    snap.option_delta = opt.delta.unwrap_or(0.0);
+    snap.option_gamma = opt.gamma.unwrap_or(0.0);
+    snap.option_theta = opt.theta.unwrap_or(0.0);
+    snap.option_price = opt.option_price.unwrap_or(0.0);
+    snap.underlying_price = opt.underlying_price.unwrap_or(0.0);
+}
+
+/// Collect a stock/index snapshot from the tick stream, returning a
+/// [`SnapshotAttempt`]. `saw_tick` is true if any market-data tick arrived (even
+/// zero-priced), which lets the retry layer tell a plain timeout apart from the
+/// competing-session signature (#27); `last_error` records the most recent
+/// stream error so a persistent failure surfaces the real cause instead of a
+/// fabricated timeout (#27 review FIX 2). A `select!` over an explicit deadline
+/// (rather than wrapping the whole future in `timeout`) means these fields and
+/// any partial data survive even when the collection times out.
+async fn collect_stock_snapshot_ticks(
     mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
-) -> OptionSnapshot {
-    let collect_fut = async {
-        let mut snap = OptionSnapshot::default();
-        while let Some(item) = data.next().await {
-            match item {
-                Ok(TickTypes::PriceSize(ps)) => match ps.price_tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
-                    TickType::Last | TickType::DelayedLast => snap.last = ps.price,
-                    _ => {}
-                },
-                Ok(TickTypes::Price(price)) => match price.tick_type {
-                    TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
-                    TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
-                    TickType::Last | TickType::DelayedLast
-                    | TickType::Close | TickType::DelayedClose => snap.last = price.price,
-                    _ => {}
-                },
-                Ok(TickTypes::OptionComputation(opt)) => {
-                    snap.option_iv = opt.implied_volatility.unwrap_or(0.0);
-                    snap.option_delta = opt.delta.unwrap_or(0.0);
-                    snap.option_gamma = opt.gamma.unwrap_or(0.0);
-                    snap.option_theta = opt.theta.unwrap_or(0.0);
-                    snap.option_price = opt.option_price.unwrap_or(0.0);
-                    snap.underlying_price = opt.underlying_price.unwrap_or(0.0);
+) -> SnapshotAttempt<StockSnapshot> {
+    let mut snap = StockSnapshot::default();
+    let mut saw_tick = false;
+    let mut last_error = None;
+    let deadline = tokio::time::sleep(Duration::from_secs(STOCK_SNAPSHOT_TIMEOUT_SECS));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            item = data.next() => {
+                match item {
+                    Some(Ok(tick)) => {
+                        saw_tick = true;
+                        match tick {
+                            TickTypes::Price(price) => match price.tick_type {
+                                TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
+                                TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
+                                TickType::Last | TickType::DelayedLast => snap.last = price.price,
+                                TickType::Close | TickType::DelayedClose => snap.close = price.price,
+                                _ => {}
+                            },
+                            TickTypes::PriceSize(ps) => match ps.price_tick_type {
+                                TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
+                                TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
+                                TickType::Last | TickType::DelayedLast => snap.last = ps.price,
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                    // Record the error but keep collecting — a transient error
+                    // may be followed by good ticks that still complete the snap.
+                    Some(Err(e)) => {
+                        tracing::warn!("stock snapshot error: {e}");
+                        last_error = Some(IbError::from(e));
+                    }
+                    None => break,
                 }
-                Err(e) => tracing::warn!("option snapshot error: {e}"),
-                _ => {}
-            }
-            // Break only once we have EVERYTHING the caller needs — a usable
-            // price AND greeks (#24). Breaking on greeks alone (IB does not
-            // guarantee price ticks arrive first) returned a zero-priced
-            // snapshot that then failed the retry gate. The 5s timeout below is
-            // the backstop that still returns whatever partial data arrived.
-            if option_snapshot_complete(&snap) {
-                break;
+                if snap.last > 0.0 || (snap.bid > 0.0 && snap.ask > 0.0) {
+                    break;
+                }
             }
         }
-        snap
-    };
+    }
+    SnapshotAttempt { snap, saw_tick, last_error }
+}
 
-    tokio::time::timeout(Duration::from_secs(5), collect_fut)
-        .await
-        .unwrap_or_default()
+/// Collect an option snapshot from the tick stream, returning a
+/// [`SnapshotAttempt`] (see [`collect_stock_snapshot_ticks`]).
+///
+/// Breaks only once the snapshot has BOTH a usable price AND greeks (#24); IB
+/// does not guarantee price ticks arrive first. Greeks are sourced with
+/// model-tick precedence via [`apply_option_computation`] (#27).
+async fn collect_option_snapshot_ticks(
+    mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
+) -> SnapshotAttempt<OptionSnapshot> {
+    let mut snap = OptionSnapshot::default();
+    let mut saw_tick = false;
+    let mut last_error = None;
+    let mut greek_rank: u8 = 0;
+    let deadline = tokio::time::sleep(Duration::from_secs(OPTION_SNAPSHOT_TIMEOUT_SECS));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            item = data.next() => {
+                match item {
+                    Some(Ok(tick)) => {
+                        saw_tick = true;
+                        match tick {
+                            TickTypes::PriceSize(ps) => match ps.price_tick_type {
+                                TickType::Bid | TickType::DelayedBid => snap.bid = ps.price,
+                                TickType::Ask | TickType::DelayedAsk => snap.ask = ps.price,
+                                TickType::Last | TickType::DelayedLast => snap.last = ps.price,
+                                _ => {}
+                            },
+                            TickTypes::Price(price) => match price.tick_type {
+                                TickType::Bid | TickType::DelayedBid => snap.bid = price.price,
+                                TickType::Ask | TickType::DelayedAsk => snap.ask = price.price,
+                                TickType::Last | TickType::DelayedLast
+                                | TickType::Close | TickType::DelayedClose => snap.last = price.price,
+                                _ => {}
+                            },
+                            TickTypes::OptionComputation(opt) => {
+                                apply_option_computation(&mut snap, &mut greek_rank, &opt);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("option snapshot error: {e}");
+                        last_error = Some(IbError::from(e));
+                    }
+                    None => break,
+                }
+                if option_snapshot_complete(&snap) {
+                    break;
+                }
+            }
+        }
+    }
+    SnapshotAttempt { snap, saw_tick, last_error }
 }
 
 /// Whether an option snapshot carries everything the caller needs: a usable
@@ -1392,14 +1636,19 @@ mod tests {
     // ── snapshot collection tests (streaming workaround for ibapi snapshot 10197) ──
 
     /// Empty stream → timeout → returns default (all-zero) snapshot.
-    #[tokio::test]
+    /// `start_paused` lets tokio auto-advance virtual time to the deadline, so
+    /// the test is instant instead of burning the real 10s wall-clock.
+    #[tokio::test(start_paused = true)]
     async fn collect_stock_snapshot_timeout_returns_default() {
         // A stream that never yields (simulates no data on the wire)
         let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, saw_tick, last_error } =
+            collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.last, 0.0);
+        assert!(!saw_tick, "no ticks arrived, so saw_tick must be false");
+        assert!(last_error.is_none(), "a silent timeout has no stream error");
     }
 
     /// Stream with valid ticks → collects bid/ask/last and breaks early.
@@ -1420,7 +1669,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
         assert_eq!(snap.ask, 101.0);
     }
@@ -1443,7 +1692,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.close, 99.0);
         assert_eq!(snap.last, 100.5);
     }
@@ -1474,7 +1723,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
     }
 
@@ -1501,7 +1750,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_stock_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_stock_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 100.0);
         assert_eq!(snap.ask, 101.0);
     }
@@ -1522,6 +1771,7 @@ mod tests {
                 ..Default::default()
             })),
             Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
                 implied_volatility: Some(0.25),
                 delta: Some(0.30),
                 gamma: Some(0.02),
@@ -1532,7 +1782,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 5.0);
         assert_eq!(snap.ask, 5.5);
         assert!((snap.option_iv - 0.25).abs() < 0.001);
@@ -1540,14 +1790,17 @@ mod tests {
         assert_eq!(snap.underlying_price, 100.0);
     }
 
-    /// Option snapshot timeout returns default.
-    #[tokio::test]
+    /// Option snapshot timeout returns default. `start_paused` keeps it instant.
+    #[tokio::test(start_paused = true)]
     async fn collect_option_snapshot_timeout_returns_default() {
         let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, saw_tick, last_error } =
+            collect_option_snapshot_ticks(stream).await;
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.option_delta, 0.0);
+        assert!(!saw_tick, "no ticks arrived, so saw_tick must be false");
+        assert!(last_error.is_none(), "a silent timeout has no stream error");
     }
 
     // ── option-snapshot completeness (issue #24) ──
@@ -1594,6 +1847,7 @@ mod tests {
         use ibapi::market_data::realtime::TickPrice;
         let ticks = vec![
             Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
                 implied_volatility: Some(0.25),
                 delta: Some(0.30),
                 ..Default::default()
@@ -1610,7 +1864,7 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let snap = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
         assert!(
             snap.bid > 0.0 || snap.ask > 0.0,
             "collector must wait for a price tick, got bid={} ask={}",
@@ -1618,6 +1872,311 @@ mod tests {
             snap.ask
         );
         assert!(snap.option_delta != 0.0, "greeks must still be present");
+    }
+
+    // ── market_data_error context preservation (#32 R1) ──
+
+    #[test]
+    fn market_data_error_preserves_context_for_classified_variant() {
+        // A classified market-data Notice must keep the call-site context (e.g.
+        // the symbol) in its message, not drop it.
+        let notice = ibapi::Notice {
+            code: 10199,
+            message: "market data not subscribed".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        let e = market_data_error(
+            "stock market data subscribe failed for SPY",
+            ibapi::Error::Notice(notice),
+        );
+        match e {
+            IbError::MarketData { code, message } => {
+                assert_eq!(code, 10199);
+                assert!(
+                    message.contains("SPY"),
+                    "call-site context/symbol dropped: {message}"
+                );
+            }
+            other => panic!("expected MarketData, got {other:?}"),
+        }
+    }
+
+    // ── snapshot_failure_error classification (#27) ──
+    //
+    // A plain market-data TIMEOUT (no ticks arrived) must be Timeout, NOT
+    // CompetingSession. CompetingSession is reserved for the true 10197
+    // signature: ticks DID arrive but every price was zero across all attempts.
+
+    #[test]
+    fn snapshot_failure_no_ticks_is_timeout() {
+        let e = snapshot_failure_error(false, 5, None);
+        match e {
+            IbError::Timeout(msg) => assert!(msg.contains("timed out")),
+            other => panic!("no-ticks failure must be Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_failure_ticks_arrived_is_competing_session() {
+        assert!(matches!(
+            snapshot_failure_error(true, 5, None),
+            IbError::CompetingSession
+        ));
+    }
+
+    #[test]
+    fn snapshot_failure_stream_error_is_surfaced_not_timeout() {
+        // #27 review FIX 2: when the collector recorded a real stream error, that
+        // error must be surfaced — never masked by a fabricated "no ticks"
+        // Timeout. The last_error outranks both the timeout and competing-session
+        // branches.
+        let e = snapshot_failure_error(false, 5, Some(IbError::ConnectionReset));
+        assert!(
+            matches!(e, IbError::ConnectionReset),
+            "a recorded stream error must be surfaced, got {e:?}"
+        );
+        // Even if saw_tick is true, the real error still wins.
+        assert!(matches!(
+            snapshot_failure_error(true, 5, Some(IbError::ConnectionReset)),
+            IbError::ConnectionReset
+        ));
+    }
+
+    #[tokio::test]
+    async fn collect_stock_snapshot_persistent_error_records_last_error() {
+        // #27 review FIX 2: a stream that only errors must not return
+        // (default, saw_tick=false) with no error — the collector must record
+        // the error so retry_market_data surfaces it instead of a false timeout.
+        let ticks = vec![Err(ibapi::Error::ConnectionReset)];
+        let stream = futures::stream::iter(ticks);
+        let attempt = collect_stock_snapshot_ticks(stream).await;
+        assert!(
+            attempt.last_error.is_some(),
+            "an errored stream must record last_error, not claim 'no ticks'"
+        );
+    }
+
+    // ── collection_result decision (#27) ──
+    //
+    // Return Err when the terminating End sentinel was NOT observed OR a stream
+    // error occurred; a clean-but-empty result still returns Ok.
+
+    #[test]
+    fn collection_result_no_end_is_err() {
+        let r = collection_result("positions", false, false, vec![1, 2]);
+        assert!(r.is_err(), "missing End sentinel must be an error");
+    }
+
+    #[test]
+    fn collection_result_error_is_err() {
+        let r = collection_result("positions", true, true, vec![1, 2]);
+        assert!(r.is_err(), "a stream error must be an error even with End seen");
+    }
+
+    #[test]
+    fn collection_result_clean_empty_is_ok_empty() {
+        let r = collection_result::<i32>("positions", true, false, vec![]);
+        assert_eq!(r.unwrap(), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn collection_result_clean_full_is_ok_items() {
+        let r = collection_result("positions", true, false, vec![1, 2, 3]);
+        assert_eq!(r.unwrap(), vec![1, 2, 3]);
+    }
+
+    // ── option computation model-tick precedence (#27) ──
+
+    #[test]
+    fn option_computation_rank_model_outranks_last_and_bid() {
+        let model = option_computation_rank(&TickType::ModelOption).unwrap();
+        let last = option_computation_rank(&TickType::LastOption).unwrap();
+        let bid = option_computation_rank(&TickType::BidOption).unwrap();
+        let ask = option_computation_rank(&TickType::AskOption).unwrap();
+        assert!(model > last, "model must outrank last");
+        assert!(last > bid, "last must outrank bid");
+        assert_eq!(bid, ask, "bid and ask rank equally");
+        // Delayed variants mirror their realtime counterparts.
+        assert_eq!(
+            option_computation_rank(&TickType::DelayedModelOption),
+            Some(model)
+        );
+    }
+
+    #[test]
+    fn option_computation_rank_ignores_non_greek_fields() {
+        assert!(option_computation_rank(&TickType::Bid).is_none());
+        assert!(option_computation_rank(&TickType::Unknown).is_none());
+    }
+
+    #[test]
+    fn apply_option_computation_model_wins_over_later_bid() {
+        // A model tick's greeks must be retained even when a bid-side
+        // computation arrives AFTERWARDS.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::ModelOption,
+            implied_volatility: Some(0.25),
+            delta: Some(0.30),
+            ..Default::default()
+        });
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.99),
+            delta: Some(0.99),
+            ..Default::default()
+        });
+        assert!((snap.option_delta - 0.30).abs() < 0.001, "later bid overwrote model delta: {}", snap.option_delta);
+        assert!((snap.option_iv - 0.25).abs() < 0.001, "later bid overwrote model iv: {}", snap.option_iv);
+    }
+
+    #[test]
+    fn apply_option_computation_falls_back_when_no_model() {
+        // With no model tick, the collector still populates greeks from the
+        // best available (bid) so callers are not left with nothing.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.40),
+            delta: Some(0.22),
+            ..Default::default()
+        });
+        assert!((snap.option_delta - 0.22).abs() < 0.001);
+        assert!((snap.option_iv - 0.40).abs() < 0.001);
+    }
+
+    #[test]
+    fn apply_option_computation_placeholder_model_does_not_lock_out_real_bid() {
+        // #27 review FIX 1: IB sends "not yet computed" greeks as f64::MAX, which
+        // ibapi decodes to None. A ModelOption placeholder (all-None) arriving
+        // first must NOT lock rank 3 and zero the snapshot — a later real
+        // BidOption must still be accepted.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::ModelOption,
+            implied_volatility: None,
+            delta: None,
+            ..Default::default()
+        });
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.40),
+            delta: Some(0.22),
+            ..Default::default()
+        });
+        assert!(
+            (snap.option_delta - 0.22).abs() < 0.001,
+            "placeholder model locked out real bid greeks: delta={}",
+            snap.option_delta
+        );
+        assert!((snap.option_iv - 0.40).abs() < 0.001);
+    }
+
+    #[test]
+    fn apply_option_computation_placeholder_resend_does_not_zero_real_greeks() {
+        // #27 review FIX 1: a same-rank resend carrying only placeholder None
+        // values must NOT overwrite previously-good greeks with 0.0.
+        let mut snap = OptionSnapshot::default();
+        let mut rank = 0u8;
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: Some(0.40),
+            delta: Some(0.22),
+            ..Default::default()
+        });
+        apply_option_computation(&mut snap, &mut rank, &ibapi::contracts::OptionComputation {
+            field: TickType::BidOption,
+            implied_volatility: None,
+            delta: None,
+            ..Default::default()
+        });
+        assert!(
+            (snap.option_delta - 0.22).abs() < 0.001,
+            "placeholder resend zeroed real greeks: delta={}",
+            snap.option_delta
+        );
+        assert!((snap.option_iv - 0.40).abs() < 0.001);
+    }
+
+    /// #27: the MODEL computation tick's greeks must win in the collector even
+    /// when bid-side computations arrive before and after it.
+    #[tokio::test]
+    async fn collect_option_snapshot_model_tick_greeks_win() {
+        use ibapi::market_data::realtime::TickPrice;
+        let ticks = vec![
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::BidOption,
+                implied_volatility: Some(0.99),
+                delta: Some(0.99),
+                ..Default::default()
+            })),
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::ModelOption,
+                implied_volatility: Some(0.25),
+                delta: Some(0.30),
+                ..Default::default()
+            })),
+            Ok(TickTypes::OptionComputation(ibapi::contracts::OptionComputation {
+                field: TickType::AskOption,
+                implied_volatility: Some(0.88),
+                delta: Some(0.88),
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.0,
+                tick_type: TickType::Bid,
+                ..Default::default()
+            })),
+            Ok(TickTypes::Price(TickPrice {
+                price: 5.5,
+                tick_type: TickType::Ask,
+                ..Default::default()
+            })),
+        ];
+        let stream = futures::stream::iter(ticks);
+        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
+        assert!((snap.option_delta - 0.30).abs() < 0.001, "model delta must win, got {}", snap.option_delta);
+        assert!((snap.option_iv - 0.25).abs() < 0.001, "model iv must win, got {}", snap.option_iv);
+    }
+
+    // ── net_liquidation parsing (#27 review FIX 4) ──
+    //
+    // The NetLiquidation tag must never be reported as a phantom Ok(0.0): a
+    // present-but-unparseable value is an error, an absent tag is an error, and
+    // only a real numeric value is Ok.
+
+    fn nl_summary(entries: &[(&str, &str)]) -> Vec<(String, String, String, String)> {
+        entries
+            .iter()
+            .map(|(tag, value)| {
+                ("acc".to_string(), tag.to_string(), value.to_string(), "USD".to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_net_liquidation_non_numeric_is_err() {
+        let summary = nl_summary(&[("NetLiquidation", "N/A")]);
+        assert!(
+            parse_net_liquidation(&summary).is_err(),
+            "an unparseable NetLiquidation must be Err, not Ok(0.0)"
+        );
+    }
+
+    #[test]
+    fn parse_net_liquidation_missing_is_err() {
+        let summary = nl_summary(&[("BuyingPower", "1000.0")]);
+        assert!(parse_net_liquidation(&summary).is_err(), "a missing tag must be Err");
+    }
+
+    #[test]
+    fn parse_net_liquidation_numeric_is_ok() {
+        let summary = nl_summary(&[("NetLiquidation", "12345.67")]);
+        assert_eq!(parse_net_liquidation(&summary).unwrap(), 12345.67);
     }
 
     // ── remote diagnostics tests ──

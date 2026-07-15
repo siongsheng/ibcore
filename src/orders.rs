@@ -367,6 +367,55 @@ fn order_rejected_from(context: &str, err: &ibapi::Error) -> IbError {
     }
 }
 
+/// Classify an order submit/cancel failure with the same philosophy as the
+/// stream path (#20, #32 R2).
+///
+/// [`place_order`](IbClient::place_order), the initial `place_order` in
+/// [`place_order_await`](IbClient::place_order_await), and
+/// [`cancel_order`](IbClient::cancel_order) previously routed EVERY failure
+/// through [`order_rejected_from`], which always yields
+/// [`IbError::OrderRejected`] — even for a mid-flight connection drop. That
+/// misclassifies a transport failure as a broker rejection: the order may still
+/// be live/filling at IB, so the caller must reconcile rather than assume it
+/// died.
+///
+/// Classification rule:
+/// - **[`Notice`](ibapi::Notice) that classifies to a connection-dead variant**
+///   ([`classify_notice`](crate::errors::classify_notice) → `ConnectionFailed` /
+///   `ConnectionReset`, i.e. transport codes 502/504/506/507/100): the order may
+///   still be live at IB, so this maps to the connection-dead variant (with
+///   `context`), NOT a rejection. This is the #32 fix.
+/// - **Any other Notice** — including out-of-range broker rejections such as 110
+///   ("price does not conform to min variation") or 434 ("order size zero"), not
+///   just the 200–299 range — maps to [`IbError::OrderRejected`] via
+///   [`order_rejected_from`], preserving the real code and any advanced-reject
+///   JSON. These are genuine "the order did not go through" refusals.
+/// - **Non-`Notice` errors** (ibapi `ConnectionReset` / `ConnectionFailed` /
+///   `Shutdown` / `Io`): connection-dead via [`IbError::from`].
+///
+/// The call-site `context` is preserved in the resulting message
+/// ([`with_context`](crate::errors::with_context) for the connection-dead paths,
+/// [`order_rejected_from`] for the rejection path) so diagnosis isn't lost.
+fn order_submit_error(context: &str, err: ibapi::Error) -> IbError {
+    if let ibapi::Error::Notice(notice) = &err {
+        let classified = crate::errors::classify_notice(
+            notice.code,
+            &notice.message,
+            &notice.advanced_order_reject_json,
+        );
+        // A transport-level Notice (502/504/506/507/100) is NOT a rejection —
+        // the order may still be working at IB, so keep it connection-dead.
+        if crate::is_connection_dead(&classified) {
+            return crate::errors::with_context(context, classified);
+        }
+        // Every other Notice — including out-of-range broker rejections — is a
+        // genuine rejection; preserve it as OrderRejected with its real code.
+        return order_rejected_from(context, &err);
+    }
+    // Non-Notice transport failures are connection-dead.
+    crate::errors::with_context(context, IbError::from(err))
+}
+
 /// Classify a stream error from [`IbClient::place_order_await`]'s subscription
 /// into an [`OrderOutcome`] (#20).
 ///
@@ -433,12 +482,12 @@ impl IbClient {
             .inner()
             .next_valid_order_id()
             .await
-            .map_err(|e| order_rejected_from("failed to get order ID", &e))?;
+            .map_err(|e| order_submit_error("failed to get order ID", e))?;
 
         self.inner()
             .submit_order(order_id, contract, order)
             .await
-            .map_err(|e| order_rejected_from("submit_order failed", &e))?;
+            .map_err(|e| order_submit_error("submit_order failed", e))?;
 
         Ok(order_id)
     }
@@ -472,7 +521,7 @@ impl IbClient {
             .inner()
             .place_order(order_id, contract, order)
             .await
-            .map_err(|e| order_rejected_from("place_order failed", &e))?;
+            .map_err(|e| order_submit_error("place_order failed", e))?;
 
         let outcome = tokio::time::timeout(timeout, async {
             let mut data = sub.filter_data();
@@ -512,7 +561,7 @@ impl IbClient {
             .inner()
             .cancel_order(order_id, "")
             .await
-            .map_err(|e| order_rejected_from("cancel_order failed", &e))?;
+            .map_err(|e| order_submit_error("cancel_order failed", e))?;
         Ok(())
     }
 
@@ -1167,6 +1216,104 @@ mod tests {
         match outcome_for_stream_error(&err, 3) {
             OrderOutcome::Pending { order_id } => assert_eq!(order_id, 3),
             other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    // ── order_submit_error tests (#32 R2) ──
+    //
+    // Submit/cancel failures must be classified with the SAME philosophy as the
+    // stream path (#20): only a proven broker-rejection Notice (200–299) is a
+    // genuine OrderRejected; a connection drop / IO / shutdown / out-of-range
+    // Notice must classify to a connection-dead variant so `is_connection_dead`
+    // is true and the caller reconciles instead of assuming the order died.
+
+    #[test]
+    fn order_submit_error_notice_201_is_order_rejected() {
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 201,
+            message: "insufficient margin".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, message, .. } => {
+                assert_eq!(code, 201);
+                assert!(message.contains("submit_order failed"), "context lost: {message}");
+                assert!(message.contains("insufficient margin"));
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_submit_error_connection_reset_is_connection_dead_not_rejected() {
+        let e = order_submit_error("place_order failed", ibapi::Error::ConnectionReset);
+        assert!(
+            matches!(e, IbError::ConnectionReset),
+            "connection reset must NOT become OrderRejected, got {e:?}"
+        );
+        assert!(crate::is_connection_dead(&e));
+    }
+
+    #[test]
+    fn order_submit_error_connection_failed_is_connection_dead() {
+        let e = order_submit_error("place_order failed", ibapi::Error::ConnectionFailed);
+        assert!(matches!(e, IbError::ConnectionFailed(_)), "got {e:?}");
+        assert!(crate::is_connection_dead(&e));
+    }
+
+    #[test]
+    fn order_submit_error_notice_502_is_connection_dead_not_rejected() {
+        // A 502 raised while submitting is a connection-level error, NOT a
+        // broker rejection — it must not surface as OrderRejected.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 502,
+            message: "Couldn't connect to TWS".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        let e = order_submit_error("submit_order failed", err);
+        assert!(
+            !matches!(e, IbError::OrderRejected { .. }),
+            "a 502 at submit must not be OrderRejected, got {e:?}"
+        );
+        assert!(crate::is_connection_dead(&e), "502 at submit must be connection-dead: {e:?}");
+    }
+
+    #[test]
+    fn order_submit_error_notice_110_is_order_rejected() {
+        // #32 review: an out-of-range broker rejection (110 "price does not
+        // conform to the minimum price variation") is still a genuine rejection
+        // — it must be OrderRejected preserving its real code, NOT flattened to
+        // IbError::Other.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 110,
+            message: "The price does not conform to the minimum price variation".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, message, .. } => {
+                assert_eq!(code, 110);
+                assert!(message.contains("submit_order failed"), "context lost: {message}");
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_submit_error_notice_434_is_order_rejected() {
+        // 434 "order size cannot be zero" — another out-of-range broker
+        // rejection that must stay OrderRejected.
+        let err = ibapi::Error::Notice(ibapi::Notice {
+            code: 434,
+            message: "The order size cannot be zero".into(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        });
+        match order_submit_error("submit_order failed", err) {
+            IbError::OrderRejected { code, .. } => assert_eq!(code, 434),
+            other => panic!("expected OrderRejected, got {other:?}"),
         }
     }
 }
