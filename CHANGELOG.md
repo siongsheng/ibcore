@@ -39,8 +39,9 @@ are behavioral and require a wildcard `_` arm on `IbError` (already
 
 ### Fixed
 - Option greeks/IV are now sourced with model-tick precedence: only a MODEL
-  computation tick (`ModelOption`/`DelayedModelOption`) sets the greeks huat's
-  screener expects, and a later bid/ask computation can no longer overwrite it.
+  computation tick (`ModelOption`/`DelayedModelOption`) sets the greeks a
+  downstream consumer expects, and a later bid/ask computation can no longer
+  overwrite it.
   Placeholder computation ticks (IB's `f64::MAX` "not yet computed", decoded to
   `None`) are skipped so they neither lock out a real tick nor zero previously
   populated greeks. Greeks remain `f64` (`Option<f64>` deferred to a follow-up)
