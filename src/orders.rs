@@ -731,6 +731,22 @@ mod tests {
         );
     }
 
+    // An empty execution_id can't correlate a commission to its fill, so the
+    // Execution/Commission mapping must reject it rather than emit an event
+    // carrying an unusable correlation key (#35).
+    #[test]
+    fn execution_correlation_id_rejects_empty() {
+        assert_eq!(super::execution_correlation_id(""), None);
+    }
+
+    #[test]
+    fn execution_correlation_id_keeps_non_empty() {
+        assert_eq!(
+            super::execution_correlation_id("abc123"),
+            Some("abc123".to_string())
+        );
+    }
+
     #[test]
     fn order_status_event_cancelled_has_reason() {
         let e = OrderStatusEvent::Cancelled {
