@@ -174,6 +174,7 @@ are behavioral and require a wildcard `_` arm on `IbError` (already
 - Full Rustdoc on all public items
 - 80 unit tests
 
+[0.3.1]: https://github.com/siongsheng/ibcore/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/siongsheng/ibcore/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/siongsheng/ibcore/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/siongsheng/ibcore/compare/v0.1.0...v0.2.0
