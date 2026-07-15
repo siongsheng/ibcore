@@ -312,6 +312,40 @@ impl From<ibcore::OrderStatusEvent> for PyOrderStatusEvent {
                 reason: String::new(),
                 status,
             },
+            // #34: a fill execution report. Carries the execution_id that a
+            // Commission joins against; shares/price reuse the existing
+            // filled_qty/avg_price fields (same shape as Filled).
+            ibcore::OrderStatusEvent::Execution {
+                order_id,
+                execution_id,
+                shares,
+                price,
+            } => PyOrderStatusEvent {
+                kind: "Execution".into(),
+                order_id,
+                filled_qty: shares,
+                avg_price: price,
+                commission: None,
+                execution_id: Some(execution_id),
+                reason: String::new(),
+                status: String::new(),
+            },
+            // #34: a commission report. Carries only an execution_id (no
+            // order_id) — join it to the matching Execution on execution_id to
+            // attribute the cost to an order.
+            ibcore::OrderStatusEvent::Commission {
+                execution_id,
+                commission,
+            } => PyOrderStatusEvent {
+                kind: "Commission".into(),
+                order_id: 0,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                commission: Some(commission),
+                execution_id: Some(execution_id),
+                reason: String::new(),
+                status: String::new(),
+            },
             // ibcore::OrderStatusEvent is #[non_exhaustive]; surface any future
             // variant as a generic "Unknown" kind rather than failing to build.
             _ => PyOrderStatusEvent {
@@ -1836,6 +1870,34 @@ mod tests {
         let py: PyOrderStatusEvent = rust.into();
         assert_eq!(py.kind, "Other");
         assert_eq!(py.status, "ApiPending");
+    }
+
+    #[test]
+    fn order_status_event_from_execution() {
+        let rust = ibcore::OrderStatusEvent::Execution {
+            order_id: 70,
+            execution_id: "exec-1".into(),
+            shares: 25.0,
+            price: 12.5,
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Execution");
+        assert_eq!(py.order_id, 70);
+        assert_eq!(py.execution_id, Some("exec-1".to_string()));
+        assert_eq!(py.filled_qty, 25.0);
+        assert_eq!(py.avg_price, 12.5);
+    }
+
+    #[test]
+    fn order_status_event_from_commission() {
+        let rust = ibcore::OrderStatusEvent::Commission {
+            execution_id: "exec-1".into(),
+            commission: 1.25,
+        };
+        let py: PyOrderStatusEvent = rust.into();
+        assert_eq!(py.kind, "Commission");
+        assert_eq!(py.execution_id, Some("exec-1".to_string()));
+        assert_eq!(py.commission, Some(1.25));
     }
 
     // ── PyOrderUpdateReceiver tests ──
