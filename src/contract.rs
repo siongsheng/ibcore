@@ -18,7 +18,11 @@ use ibapi::contracts::{Contract, OptionRight, SecurityType};
 /// `contract_details`. Parameterizing the multiplier is deliberately out of
 /// scope; this named constant documents the assumption and keeps the literal
 /// in one place.
-pub const DEFAULT_OPTION_MULTIPLIER: &str = "100";
+///
+/// `pub(crate)`: an ibcore-internal assumption, not part of the public API
+/// (nothing outside the crate — including the Python binding and huat —
+/// references it).
+pub(crate) const DEFAULT_OPTION_MULTIPLIER: &str = "100";
 
 /// Build an IB option contract for `contract_details` resolution.
 ///
