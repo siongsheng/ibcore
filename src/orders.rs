@@ -71,12 +71,15 @@ pub enum OrderStatusEvent {
         filled_qty: f64,
         /// Average fill price.
         avg_price: f64,
-        /// Optional commission from the next commission report.
+        /// Always `None` post-#23: commission no longer rides on the fill
+        /// status. Retained as a public field for API stability; consumers
+        /// read commission from [`Commission`](Self::Commission), joined to a
+        /// fill via [`Execution`](Self::Execution) on `execution_id`.
         commission: Option<f64>,
-        /// Execution ID from the CommissionReport, for correlating fills
-        /// with their commission reports. `None` for fill-status events
-        /// (which carry no execution ID), `Some(...)` for commission-report
-        /// events.
+        /// Always `None` post-#23: fill-status events carry no execution id.
+        /// Retained as a public field for API stability; the correlation id
+        /// now flows through [`Execution`](Self::Execution) /
+        /// [`Commission`](Self::Commission), which carry a raw `String`.
         execution_id: Option<String>,
     },
     /// Order was cancelled.
@@ -253,16 +256,28 @@ fn map_order_update(update: &ibapi::orders::OrderUpdate) -> Option<OrderStatusEv
     use ibapi::orders::OrderUpdate;
     match update {
         OrderUpdate::OrderStatus(status) => Some(map_order_status(status)),
-        OrderUpdate::ExecutionData(data) => Some(OrderStatusEvent::Execution {
-            order_id: data.execution.order_id,
-            execution_id: data.execution.execution_id.clone(),
-            shares: data.execution.shares,
-            price: data.execution.price,
-        }),
-        OrderUpdate::CommissionReport(report) => Some(OrderStatusEvent::Commission {
-            execution_id: report.execution_id.clone(),
-            commission: report.commission,
-        }),
+        // An empty execution_id would collapse the commission-correlation join
+        // (every empty-id commission would match every empty-id execution), so
+        // drop such an event rather than emit an unusable correlation key (#35).
+        // A fill's terminal OrderStatus still arrives separately.
+        OrderUpdate::ExecutionData(data) => {
+            execution_correlation_id(&data.execution.execution_id).map(|execution_id| {
+                OrderStatusEvent::Execution {
+                    order_id: data.execution.order_id,
+                    execution_id,
+                    shares: data.execution.shares,
+                    price: data.execution.price,
+                }
+            })
+        }
+        OrderUpdate::CommissionReport(report) => {
+            execution_correlation_id(&report.execution_id).map(|execution_id| {
+                OrderStatusEvent::Commission {
+                    execution_id,
+                    commission: report.commission,
+                }
+            })
+        }
         // OpenOrder is a one-shot snapshot concern, not a status event.
         OrderUpdate::OpenOrder(_) => None,
     }
@@ -445,18 +460,21 @@ fn outcome_for_stream_error(err: &IbError, order_id: i32) -> OrderOutcome {
     }
 }
 
-/// Normalize an IB execution ID string: empty strings are coerced to `None`,
-/// preserving non-empty values. This prevents `Some("")` which would force
-/// every consumer to check for empty strings.
+/// Validate an IB execution id for use as a commission-correlation key.
 ///
-/// Retained as the canonical rule for the `Option<String>` `execution_id` on
-/// [`OrderStatusEvent::Filled`]. After #23, commission/execution ids flow
-/// through the dedicated [`OrderStatusEvent::Commission`]/[`Execution`](OrderStatusEvent::Execution)
-/// variants (which carry a raw, always-present `String`), so no production path
-/// currently calls this — `allow(dead_code)` keeps the contract and its tests.
-#[allow(dead_code)]
-fn normalize_execution_id(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+/// Returns `Some(id)` for a non-empty id, `None` for an empty one. IB is
+/// expected to always populate the id on an [`Execution`](ibapi::orders::Execution)
+/// / [`CommissionReport`](ibapi::orders::CommissionReport), but an empty id
+/// would collapse the [`Execution`](OrderStatusEvent::Execution) ↔
+/// [`Commission`](OrderStatusEvent::Commission) join (every empty id matching
+/// every other), so `map_order_update` drops such events rather than emit an
+/// unusable key (#35).
+fn execution_correlation_id(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 impl IbClient {
@@ -718,15 +736,18 @@ mod tests {
         }
     }
 
+    // An empty execution_id can't correlate a commission to its fill, so the
+    // Execution/Commission mapping must reject it rather than emit an event
+    // carrying an unusable correlation key (#35).
     #[test]
-    fn normalize_execution_id_coerces_empty_string() {
-        assert_eq!(super::normalize_execution_id("".into()), None);
+    fn execution_correlation_id_rejects_empty() {
+        assert_eq!(super::execution_correlation_id(""), None);
     }
 
     #[test]
-    fn normalize_execution_id_preserves_non_empty() {
+    fn execution_correlation_id_keeps_non_empty() {
         assert_eq!(
-            super::normalize_execution_id("abc123".into()),
+            super::execution_correlation_id("abc123"),
             Some("abc123".to_string())
         );
     }
