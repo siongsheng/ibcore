@@ -1863,17 +1863,27 @@ mod tests {
         assert_eq!(OPTION_SNAPSHOT_TIMEOUT_SECS, 10);
     }
 
-    /// IB notices are logged by severity (issue #39). `notice_is_warn` decides
-    /// WARN (operator attention) vs INFO (routine): data-farm broken/inactive/
-    /// connecting, delayed-data fallback, market-data-not-subscribed, and
-    /// competing-session codes warrant WARN; farm-OK and generic notices → INFO.
+    /// IB notices are logged by severity (issue #39). `notice_is_warn` is a
+    /// benign-allowlist: a small set of routine/OK notices logs at INFO, and
+    /// EVERYTHING else — including connectivity loss (1100/1101), farm flaps,
+    /// delayed-data fallback, not-subscribed, competing-session, AND any
+    /// unlisted/future code — defaults to WARN. WARN-by-default is deliberate:
+    /// operators run gateways at `warn` in prod, so an unclassified but
+    /// degrading notice must be loud rather than silently INFO.
     #[test]
     fn notice_is_warn_flags_attention_codes() {
-        for code in [354, 2103, 2105, 2107, 2108, 2110, 2119, 10167, 10168, 10197] {
+        // Known attention codes → WARN, incl. connectivity-lost 1100/1101.
+        for code in [1100, 1101, 354, 2103, 2105, 2107, 2108, 2110, 2119, 10167, 10168, 10197] {
             assert!(notice_is_warn(code), "code {code} should be WARN");
         }
-        for code in [2104, 2106, 2158, 2100, 2137] {
+        // Benign/routine → INFO: farm-OK, connectivity-restored-clean (1102),
+        // account-data-unsubscribed (2100), cross-side order warning (2137).
+        for code in [1102, 2100, 2104, 2106, 2137, 2158] {
             assert!(!notice_is_warn(code), "code {code} should be INFO");
+        }
+        // Unknown / future codes default to WARN (loud-by-default).
+        for code in [0, 9999, 12345] {
+            assert!(notice_is_warn(code), "unknown code {code} should default to WARN");
         }
     }
 
