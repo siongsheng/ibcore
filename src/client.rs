@@ -1803,6 +1803,28 @@ mod tests {
         assert!(last_error.is_none(), "a silent timeout has no stream error");
     }
 
+    /// Default option-snapshot timeout was raised 5s → 10s (issue #40): a 5s
+    /// window on a slow/reconnecting market-data farm returned one-sided
+    /// (partial) quotes. Pin the raised default so it can't silently regress.
+    #[test]
+    fn option_snapshot_timeout_default_is_raised() {
+        assert_eq!(OPTION_SNAPSHOT_TIMEOUT_SECS, 10);
+    }
+
+    /// IB notices are logged by severity (issue #39). `notice_is_warn` decides
+    /// WARN (operator attention) vs INFO (routine): data-farm broken/inactive/
+    /// connecting, delayed-data fallback, market-data-not-subscribed, and
+    /// competing-session codes warrant WARN; farm-OK and generic notices → INFO.
+    #[test]
+    fn notice_is_warn_flags_attention_codes() {
+        for code in [354, 2103, 2105, 2107, 2108, 2110, 2119, 10167, 10168, 10197] {
+            assert!(notice_is_warn(code), "code {code} should be WARN");
+        }
+        for code in [2104, 2106, 2158, 2100, 2137] {
+            assert!(!notice_is_warn(code), "code {code} should be INFO");
+        }
+    }
+
     // ── option-snapshot completeness (issue #24) ──
 
     #[test]
