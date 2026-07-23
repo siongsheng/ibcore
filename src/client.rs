@@ -94,25 +94,26 @@ pub fn is_connection_dead(e: &IbError) -> bool {
     matches!(e, IbError::ConnectionReset | IbError::ConnectionFailed(_))
 }
 
-/// Whether an IB notice code warrants operator attention (log at WARN) rather
-/// than routine INFO. WARN covers data-farm broken/inactive/connecting, the
-/// delayed-market-data fallback, market-data-not-subscribed, and the competing
-/// live-session code — states that silently degrade market data and are the
-/// usual root cause behind empty or one-sided quotes. Everything else (farm-OK
-/// notices, generic informational codes) is INFO.
+/// Whether an IB notice code should log at WARN rather than routine INFO.
+///
+/// This is a **benign-allowlist**: only a small set of routine/OK notices is
+/// INFO, and EVERYTHING else defaults to WARN — including connectivity loss
+/// (1100/1101), data-farm broken/inactive/connecting, delayed-data fallback,
+/// market-data-not-subscribed, competing live session, and any unlisted or
+/// future code. WARN-by-default is deliberate: operators run gateways at `warn`
+/// in production, so an unclassified but degrading notice must be loud, not
+/// silently INFO (the failure mode this logging exists to kill). New benign
+/// codes are triaged down by adding them here; nothing degrading hides by
+/// omission.
 fn notice_is_warn(code: i32) -> bool {
-    matches!(
+    !matches!(
         code,
-        354         // requested market data is not subscribed
-        | 2103      // market data farm connection is broken
-        | 2105      // HMDS data farm connection is broken
-        | 2107      // HMDS data farm connection is inactive
-        | 2108      // market data farm connection is inactive
-        | 2110      // connectivity between IB and the Gateway has been lost
-        | 2119      // market data farm is connecting
-        | 10167     // requested market data requires delayed data (displaying delayed)
-        | 10168     // displaying delayed market data
-        | 10197     // no market data during competing live session
+        1102        // connectivity restored — data maintained (no action)
+        | 2100      // API client unsubscribed from account data
+        | 2104      // market data farm connection is OK
+        | 2106      // HMDS data farm connection is OK
+        | 2137      // cross-side order warning (not market-data degradation)
+        | 2158      // sec-def data farm connection is OK
     )
 }
 
@@ -359,7 +360,12 @@ impl IbClient {
                         let _ = tx.send(event);
                     }
                     None => {
-                        tracing::debug!("notice stream ended");
+                        // Reached only when the stream ends on its own while the
+                        // connection is nominally live (intentional disconnect/
+                        // reconnect aborts this task instead). That silences all
+                        // notice logging + diagnostic broadcast from here on, so
+                        // it is operator-relevant — WARN, not debug (#39 review).
+                        tracing::warn!("IB notice stream ended unexpectedly — notices no longer logged until reconnect");
                         break;
                     }
                 }
@@ -1097,11 +1103,20 @@ impl IsZeroPriced for OptionSnapshot {
 const STOCK_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 /// Streaming-snapshot collection timeout for options (seconds).
 ///
-/// Raised 5 → 10 (issue #40): a 5s per-attempt window on a slow or reconnecting
-/// market-data farm frequently expired before both the bid and ask ticks
-/// arrived, so the collector returned a one-sided (partial) snapshot. 10s
-/// matches the stock timeout, keeping the worst-case option retry budget
-/// (3 × 10s + backoff ≈ 37s) in line with the stock path.
+/// Raised 5 → 10 (issue #40): on a slow or reconnecting market-data farm, a 5s
+/// per-attempt window could expire before ANY price tick arrived, yielding an
+/// empty (default) snapshot that then failed the retry/validity gate. 10s gives
+/// the farm more time to deliver ticks and matches the stock timeout, keeping
+/// the worst-case option retry budget (3 × 10s + backoff ≈ 37s) in line with
+/// the stock path.
+///
+/// NOTE: this does NOT make a one-sided snapshot two-sided. The collector
+/// early-breaks on [`option_snapshot_complete`] (one price side OR the other,
+/// AND greeks), so once one side + greeks arrive it returns immediately —
+/// regardless of this window. Enforcing that both bid and ask are present is
+/// the caller's responsibility (a two-sided market-data gate), not this
+/// timeout's. Distinguishing a timeout miss (0.0 default) from IB's no-data
+/// sentinel (-1) is deferred (see the PR notes / follow-up).
 const OPTION_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 
 /// Outcome of one snapshot-collection attempt (internal).
