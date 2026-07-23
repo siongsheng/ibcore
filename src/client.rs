@@ -94,6 +94,28 @@ pub fn is_connection_dead(e: &IbError) -> bool {
     matches!(e, IbError::ConnectionReset | IbError::ConnectionFailed(_))
 }
 
+/// Whether an IB notice code warrants operator attention (log at WARN) rather
+/// than routine INFO. WARN covers data-farm broken/inactive/connecting, the
+/// delayed-market-data fallback, market-data-not-subscribed, and the competing
+/// live-session code — states that silently degrade market data and are the
+/// usual root cause behind empty or one-sided quotes. Everything else (farm-OK
+/// notices, generic informational codes) is INFO.
+fn notice_is_warn(code: i32) -> bool {
+    matches!(
+        code,
+        354         // requested market data is not subscribed
+        | 2103      // market data farm connection is broken
+        | 2105      // HMDS data farm connection is broken
+        | 2107      // HMDS data farm connection is inactive
+        | 2108      // market data farm connection is inactive
+        | 2110      // connectivity between IB and the Gateway has been lost
+        | 2119      // market data farm is connecting
+        | 10167     // requested market data requires delayed data (displaying delayed)
+        | 10168     // displaying delayed market data
+        | 10197     // no market data during competing live session
+    )
+}
+
 /// Build an [`IbError`] from a market-data subscribe/fetch failure, routing the
 /// raw [`ibapi::Error`] through [`IbError::from`] so it is classified correctly
 /// (#21).
@@ -313,6 +335,16 @@ impl IbClient {
             loop {
                 match notice_stream.next().await {
                     Some(notice) => {
+                        // Log the notice by severity (#39). Previously notices
+                        // were only broadcast on `diagnostic_tx` and never
+                        // logged, so farm flaps / delayed-data fallback /
+                        // not-subscribed messages were invisible to operators —
+                        // the usual root cause behind empty or one-sided quotes.
+                        if notice_is_warn(notice.code) {
+                            tracing::warn!("IB notice [{}]: {}", notice.code, notice.message);
+                        } else {
+                            tracing::info!("IB notice [{}]: {}", notice.code, notice.message);
+                        }
                         let event = DiagnosticEvent {
                             gateway_version: sv,
                             error_code: notice.code,
@@ -416,6 +448,16 @@ impl IbClient {
             loop {
                 match notice_stream.next().await {
                     Some(notice) => {
+                        // Log the notice by severity (#39). Previously notices
+                        // were only broadcast on `diagnostic_tx` and never
+                        // logged, so farm flaps / delayed-data fallback /
+                        // not-subscribed messages were invisible to operators —
+                        // the usual root cause behind empty or one-sided quotes.
+                        if notice_is_warn(notice.code) {
+                            tracing::warn!("IB notice [{}]: {}", notice.code, notice.message);
+                        } else {
+                            tracing::info!("IB notice [{}]: {}", notice.code, notice.message);
+                        }
                         let event = DiagnosticEvent {
                             gateway_version: sv,
                             error_code: notice.code,
@@ -791,7 +833,9 @@ impl IbClient {
             .map_err(|e| market_data_error("option market data subscribe failed", e))?;
         let data = sub.filter_data();
 
-        let result = collect_option_snapshot_ticks(data).await;
+        let result =
+            collect_option_snapshot_ticks(data, Duration::from_secs(OPTION_SNAPSHOT_TIMEOUT_SECS))
+                .await;
 
         // sub dropped here → streaming subscription cancelled
         Ok(result)
@@ -1052,7 +1096,13 @@ impl IsZeroPriced for OptionSnapshot {
 /// Streaming-snapshot collection timeout for stocks/indices (seconds).
 const STOCK_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 /// Streaming-snapshot collection timeout for options (seconds).
-const OPTION_SNAPSHOT_TIMEOUT_SECS: u64 = 5;
+///
+/// Raised 5 → 10 (issue #40): a 5s per-attempt window on a slow or reconnecting
+/// market-data farm frequently expired before both the bid and ask ticks
+/// arrived, so the collector returned a one-sided (partial) snapshot. 10s
+/// matches the stock timeout, keeping the worst-case option retry budget
+/// (3 × 10s + backoff ≈ 37s) in line with the stock path.
+const OPTION_SNAPSHOT_TIMEOUT_SECS: u64 = 10;
 
 /// Outcome of one snapshot-collection attempt (internal).
 ///
@@ -1286,12 +1336,13 @@ async fn collect_stock_snapshot_ticks(
 /// model-tick precedence via [`apply_option_computation`] (#27).
 async fn collect_option_snapshot_ticks(
     mut data: impl futures::Stream<Item = Result<TickTypes, ibapi::Error>> + Unpin,
+    timeout: Duration,
 ) -> SnapshotAttempt<OptionSnapshot> {
     let mut snap = OptionSnapshot::default();
     let mut saw_tick = false;
     let mut last_error = None;
     let mut greek_rank: u8 = 0;
-    let deadline = tokio::time::sleep(Duration::from_secs(OPTION_SNAPSHOT_TIMEOUT_SECS));
+    let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -1782,7 +1833,8 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } =
+            collect_option_snapshot_ticks(stream, Duration::from_secs(10)).await;
         assert_eq!(snap.bid, 5.0);
         assert_eq!(snap.ask, 5.5);
         assert!((snap.option_iv - 0.25).abs() < 0.001);
@@ -1795,7 +1847,7 @@ mod tests {
     async fn collect_option_snapshot_timeout_returns_default() {
         let stream = futures::stream::pending::<Result<TickTypes, ibapi::Error>>();
         let SnapshotAttempt { snap, saw_tick, last_error } =
-            collect_option_snapshot_ticks(stream).await;
+            collect_option_snapshot_ticks(stream, Duration::from_secs(10)).await;
         assert_eq!(snap.bid, 0.0);
         assert_eq!(snap.ask, 0.0);
         assert_eq!(snap.option_delta, 0.0);
@@ -1886,7 +1938,8 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } =
+            collect_option_snapshot_ticks(stream, Duration::from_secs(10)).await;
         assert!(
             snap.bid > 0.0 || snap.ask > 0.0,
             "collector must wait for a price tick, got bid={} ask={}",
@@ -2160,7 +2213,8 @@ mod tests {
             })),
         ];
         let stream = futures::stream::iter(ticks);
-        let SnapshotAttempt { snap, .. } = collect_option_snapshot_ticks(stream).await;
+        let SnapshotAttempt { snap, .. } =
+            collect_option_snapshot_ticks(stream, Duration::from_secs(10)).await;
         assert!((snap.option_delta - 0.30).abs() < 0.001, "model delta must win, got {}", snap.option_delta);
         assert!((snap.option_iv - 0.25).abs() < 0.001, "model iv must win, got {}", snap.option_iv);
     }
