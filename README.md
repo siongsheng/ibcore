@@ -498,6 +498,24 @@ ib.disconnect()
 - [ibquirk](https://ibquirk.vercel.app) — AI bot that diagnoses IBKR API problems using ibcore's DiagnosticEvents. Join the waitlist.
 - [Discord](https://discord.gg/Z2FrsCx4H) — Community for IBKR API developers. Get help, report bugs, share quirks.
 
+## Paid help
+
+ibcore is free and MIT-licensed, and stays that way. If you want the person who built it to
+fix your IBKR integration, there are two fixed-scope, fixed-price options. You keep your
+credentials at all times; I never log in to your account.
+
+| Offer | What you get | Price |
+|---|---|---|
+| **Gateway ops setup** | IB Gateway in Docker with IBC, daily auto-restart with session persistence (so weekly 2FA is the only manual step), health probe, alerting, second-username market-data setup, and a written runbook committed to your repo. | USD 700 |
+| **Integration audit + fix sprint** | Review of your TWS API code for the known failure classes (1100/1101/1102 reconnects, combo partial fills, delayed-vs-live data, 10089/200/321 handling, multi-account scoping), a written findings list, and fixes to an agreed subset. | USD 1,200 |
+
+Both are delivered async over 1–2 weeks. Fifty percent on start, fifty percent on delivery.
+Software is provided as-is; no trading advice, no warranty of trading results.
+
+To ask, email **siongsheng@gmail.com** with the subject `ibcore paid help` and include: what
+you are running (language, Gateway version, paper or live), what is breaking, and your budget.
+Or ask in the [Discord](https://discord.gg/Z2FrsCx4H).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
