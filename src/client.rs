@@ -149,7 +149,7 @@ fn market_data_error(context: &str, e: ibapi::Error) -> IbError {
 /// IB delivers one-shot collections (positions, account summary) as a sequence
 /// terminated by an End sentinel. Returning whatever was collected when that
 /// sentinel never arrived — or after a mid-stream error — hands the caller
-/// TRUNCATED data as if it were complete, and huat sizes orders off these. This
+/// TRUNCATED data as if it were complete, and a caller may size orders from it. This
 /// mirrors the correct pattern already used by [`IbClient::pnl`]: surface an
 /// [`Err`] when the End sentinel was NOT observed OR a stream error occurred; a
 /// clean-but-empty result is a legitimate [`Ok`] (e.g. an account with no
@@ -1065,8 +1065,8 @@ impl IbClient {
     /// Fetch NetLiquidation from account summary.
     ///
     /// Returns `Err` (not a phantom `Ok(0.0)`) when the tag is absent from a
-    /// cleanly-completed summary OR present but unparseable, so huat never sizes
-    /// orders off a fabricated zero and instead reuses its cached net-liq (#27).
+    /// cleanly-completed summary OR present but unparseable, so a caller never sizes
+    /// orders from a fabricated zero and can fall back to a cached value (#27).
     pub async fn net_liquidation(&self, _account_id: &str) -> Result<f64, IbError> {
         let summary = self.account_summary(&["NetLiquidation"]).await?;
         parse_net_liquidation(&summary)
@@ -1234,7 +1234,7 @@ where
 ///
 /// IB emits BidOption=10 / AskOption=11 / LastOption=12 / ModelOption=13
 /// computation ticks (plus delayed 80–83). The MODEL tick carries the greeks/IV
-/// TWS shows and that huat's screener expects, so it must win; last/bid/ask are
+/// TWS shows and that a downstream consumer expects, so it must win; last/bid/ask are
 /// only fallbacks when no model tick ever arrives. Higher rank wins. Returns
 /// `None` for computation fields we never source greeks from.
 fn option_computation_rank(field: &TickType) -> Option<u8> {

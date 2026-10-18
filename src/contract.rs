@@ -20,7 +20,7 @@ use ibapi::contracts::{Contract, OptionRight, SecurityType};
 /// in one place.
 ///
 /// `pub(crate)`: an ibcore-internal assumption, not part of the public API
-/// (nothing outside the crate — including the Python binding and huat —
+/// (nothing outside the crate — including the Python binding and downstream consumers —
 /// references it).
 pub(crate) const DEFAULT_OPTION_MULTIPLIER: &str = "100";
 

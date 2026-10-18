@@ -63,7 +63,7 @@ pub use streaming::{TickEvent, TickStream};
 pub use orders::{OpenOrder, OrderOutcome, OrderStatusEvent, OrderStatusStream};
 pub use historical::{Bar, BarSize, Duration, HistoricalData, WhatToShow, TradingHours};
 
-// ibapi re-exports — so Huat only needs ibcore
+// ibapi re-exports — so a downstream consumer only needs ibcore
 pub use ibapi::contracts::{Contract, OptionRight, SecurityType, LegAction, Symbol};
 pub use ibapi::accounts::{Position, PnL};
 pub use ibapi::orders::{Action, OrderStatusKind, Orders, order_builder::{combo_limit_order, combo_market_order}};
