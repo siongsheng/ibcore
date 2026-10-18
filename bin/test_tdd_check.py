@@ -74,7 +74,7 @@ class TestIsTestFile(unittest.TestCase):
 
     def test_specs_docs_dir_is_not_test(self):
         # A `specs/` directory is the spec-driven-development docs convention
-        # (edge-radar/dokima all use it), NOT tests. And a doc file is
+        # (several downstream repos, dokima among them, use it), NOT tests. And a doc file is
         # never a test regardless of path.
         self.assertFalse(tc.is_test_file("specs/roadmap.md"))
         self.assertFalse(tc.is_test_file("specs/mission.md"))
